@@ -1,0 +1,451 @@
+
+# =========================================
+# MILDEW PROOF PACKAGE
+# =========================================
+#
+# OVERVIEW:
+# ---------
+# Automatic mildew protection for climate/AC systems. After cooling or heating
+# cycles, it runs the fan to remove residual moisture, preventing mold growth.
+#
+# KEY FEATURES:
+# -------------
+# • Automatic Mode - Starts mildew proof when AC turns off from cooling/heating
+# • Manual Trigger - Start mildew proof on demand anytime
+# • User Priority - Stops automatically if user changes mode
+# • Live Status - Real-time countdown and status display
+# • Flexible Config - Adjustable delay, duration, and active modes
+#
+# INSTALLATION:
+# -------------
+# Add to your ESPHome configuration:
+#
+#    substitutions:
+#      climate_id: "my_climate"  # Your climate entity ID
+#
+#    packages:
+#      mildew_proof: !include common/climate/mildew_proof.yaml
+#
+#    climate:
+#      - platform: CLIMATE_PLATFORM
+#        id: my_climate
+#        ...
+#        on_state:
+#          - script.execute: handle_climate_state_change
+#
+# PROVIDED CONTROLS:
+# ------------------
+# • "Mildew Proof Auto" - Enable/disable automatic mode
+# • "Mildew Proof Auto Delay" - Set auto mode delay (1-60 sec)
+# • "Mildew Proof Active Modes" - Configure which modes need mildew protection
+# • "Mildew Proof Duration" - Set fan duration (1-180 min)
+# • "Start Mildew Proof" - Manual trigger
+# • "Cancel Mildew Proof" - Stop active process
+# • "Mildew Proof Status" - Shows active status
+# • "Mildew Proof Countdown" - Shows time remaining
+#
+# HOW IT WORKS:
+# -------------
+# 1. AC turns OFF from cooling/heating mode
+# 2. System waits for configured delay (auto mode only)
+# 3. Switches to FAN_ONLY mode for moisture removal
+# 4. Runs for configured duration
+# 5. Returns to OFF state when complete
+# 6. Can be interrupted by user or manual mode change
+#
+# =========================================
+
+substitutions:
+  climate_id: "my_climate"  # Climate entity ID to control
+  default_mildew_proof_active_modes: "cool,heat_cool,dry"  # Modes that need mildew protection when turned off
+  default_mildew_proof_auto_delay_seconds: "1"  # Delay before starting mildew proof in auto mode
+  default_mildew_proof_fan_duration_minutes: "60"  # Duration of fan-only mode for moisture removal
+  # Loop detection settings
+  max_state_changes_per_minute: "10"  # Maximum state changes allowed within detection window
+  loop_detection_window_seconds: "60"  # Time window for counting state changes
+  loop_protection_cooldown_seconds: "300"  # Cooldown period after loop detection triggers
+
+globals:
+  - id: previous_climate_mode
+    type: ClimateMode
+    initial_value: 'CLIMATE_MODE_OFF'
+
+  - id: mildew_proof_auto_delay_active
+    type: bool
+    initial_value: 'false'
+
+  - id: mildew_proof_mode_active
+    type: bool
+    initial_value: 'false'
+
+  - id: mildew_proof_start_time
+    type: time_t
+    initial_value: '0'
+
+  - id: mildew_proof_internal_action
+    type: bool
+    initial_value: 'false'
+
+  - id: state_change_count
+    type: int
+    initial_value: '0'
+
+  - id: state_change_window_start
+    type: time_t
+    initial_value: '0'
+
+  - id: loop_protection_active
+    type: bool
+    initial_value: 'false'
+
+  - id: is_active_mode_fn
+    type: 'std::function<bool(ClimateMode, const std::string&)>'
+    initial_value: |-
+      [](ClimateMode mode, const std::string& modes_str) -> bool {
+        std::string mode_name;
+        switch (mode) {
+          case CLIMATE_MODE_COOL: mode_name = "cool"; break;
+          case CLIMATE_MODE_HEAT: mode_name = "heat"; break;
+          case CLIMATE_MODE_HEAT_COOL: mode_name = "heat_cool"; break;
+          case CLIMATE_MODE_DRY: mode_name = "dry"; break;
+          case CLIMATE_MODE_FAN_ONLY: mode_name = "fan_only"; break;
+          default: return false;
+        }
+
+        // Parse comma-separated modes
+        size_t pos = 0;
+        size_t next = 0;
+        while (next != std::string::npos) {
+          next = modes_str.find(',', pos);
+          std::string mode_token = (next == std::string::npos)
+            ? modes_str.substr(pos)
+            : modes_str.substr(pos, next - pos);
+
+          // Trim leading whitespace
+          size_t start = mode_token.find_first_not_of(" \t\r\n");
+          if (start != std::string::npos) {
+            // Trim trailing whitespace
+            size_t end = mode_token.find_last_not_of(" \t\r\n");
+            std::string trimmed = mode_token.substr(start, end - start + 1);
+
+            // Check if this matches our mode
+            if (trimmed == mode_name) {
+              return true;
+            }
+          }
+
+          pos = next + 1;
+        }
+        return false;
+      }
+
+switch:
+  - platform: template
+    name: "Mildew Proof Auto"
+    id: mildew_proof_auto_enabled
+    icon: "mdi:air-filter"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+
+button:
+  - platform: template
+    name: "Start Mildew Proof"
+    icon: "mdi:shield-check"
+    on_press:
+      - script.execute: start_mildew_proof_mode
+
+  - platform: template
+    name: "Cancel Mildew Proof"
+    icon: "mdi:shield-remove"
+    on_press:
+      - script.execute: cancel_mildew_proof
+
+number:
+  - platform: template
+    name: "Mildew Proof Duration"
+    id: mildew_proof_duration
+    icon: "mdi:fan-clock"
+    mode: box
+    unit_of_measurement: "min"
+    optimistic: true
+    min_value: 1
+    max_value: 180
+    initial_value: $default_mildew_proof_fan_duration_minutes
+    restore_value: true
+    step: 1
+    entity_category: config
+
+  - platform: template
+    name: "Mildew Proof Auto Delay"
+    id: mildew_proof_auto_delay
+    icon: "mdi:timer-outline"
+    mode: box
+    unit_of_measurement: "s"
+    optimistic: true
+    min_value: 1
+    max_value: 60
+    initial_value: $default_mildew_proof_auto_delay_seconds
+    restore_value: true
+    step: 1
+    entity_category: config
+
+binary_sensor:
+  - platform: template
+    name: "Mildew Proof Status"
+    icon: "mdi:shield-check"
+    lambda: return id(mildew_proof_mode_active);
+
+text_sensor:
+  - platform: template
+    name: "Mildew Proof Countdown"
+    icon: "mdi:timer-outline"
+    disabled_by_default: true
+    lambda: |-
+      if (!id(mildew_proof_mode_active)) {
+        return std::string("");
+      }
+
+      time_t now = millis() / 1000;
+      int elapsed = (int)(now - id(mildew_proof_start_time));
+      int total_duration = (int)(id(mildew_proof_duration).state * 60);
+      int remaining = total_duration - elapsed;
+
+      if (remaining <= 0) {
+        return std::string("00:00");
+      }
+
+      int minutes = remaining / 60;
+      int seconds = remaining % 60;
+      char buffer[16];
+      snprintf(buffer, sizeof(buffer), "%02d:%02d", minutes, seconds);
+      return std::string(buffer);
+    update_interval: 1s
+
+text:
+  - platform: template
+    name: "Mildew Proof Active Modes"
+    id: mildew_proof_modes
+    icon: "mdi:format-list-bulleted"
+    initial_value: $default_mildew_proof_active_modes
+    optimistic: true
+    restore_value: true
+    entity_category: config
+    mode: text
+
+script:
+  - id: handle_climate_state_change
+    then:
+      - lambda: |-
+          // ========================================
+          // INITIALIZATION
+          // ========================================
+          time_t now = millis() / 1000;
+
+          // ========================================
+          // SECTION 1: ANOMALY LOOP DETECTION
+          // ========================================
+
+          // Reset counter if window expired
+          if (now - id(state_change_window_start) > $loop_detection_window_seconds) {
+            id(state_change_count) = 0;
+            id(state_change_window_start) = now;
+          }
+
+          // Increment state change counter
+          id(state_change_count)++;
+
+          // Check for anomaly loop
+          if (id(state_change_count) > $max_state_changes_per_minute) {
+            if (!id(loop_protection_active)) {
+              ESP_LOGE("mildew_proof", "ANOMALY DETECTED: Too many state changes (%d in %d seconds)",
+                       id(state_change_count), $loop_detection_window_seconds);
+              id(loop_protection_active) = true;
+
+              // Force stop all mildew proof activities
+              id(mildew_proof_mode_active) = false;
+              id(mildew_proof_auto_delay_active) = false;
+              id(mildew_proof_process).stop();
+              id(start_mildew_proof_mode_with_delay).stop();
+
+              ESP_LOGW("mildew_proof", "All mildew proof activities stopped due to loop detection");
+            }
+            return;  // Exit to prevent further processing
+          }
+
+          // ========================================
+          // SECTION 2: COOLDOWN PERIOD MANAGEMENT
+          // ========================================
+
+          // Check if in cooldown period
+          if (id(loop_protection_active)) {
+            static time_t cooldown_start = 0;
+            if (cooldown_start == 0) {
+              cooldown_start = now;
+            }
+
+            if (now - cooldown_start < $loop_protection_cooldown_seconds) {
+              ESP_LOGD("mildew_proof", "In cooldown period, skipping processing");
+              return;
+            } else {
+              ESP_LOGI("mildew_proof", "Cooldown period ended, resuming normal operation");
+              id(loop_protection_active) = false;
+              id(state_change_count) = 0;
+              cooldown_start = 0;
+            }
+          }
+
+          // ========================================
+          // SECTION 3: INTERNAL ACTION FILTERING
+          // ========================================
+
+          // Skip if this is an internal action
+          if (id(mildew_proof_internal_action)) {
+            ESP_LOGD("mildew_proof", "Skipping state change handler (internal action)");
+            id(mildew_proof_internal_action) = false;
+            return;
+          }
+
+          // ========================================
+          // SECTION 4: STATE CAPTURE AND LOGGING
+          // ========================================
+
+          ClimateMode current_mode = id($climate_id).mode;
+          ESP_LOGD("mildew_proof", "State: current=%s, previous=%s, active=%d, delay=%d, changes=%d",
+                   LOG_STR_ARG(climate_mode_to_string(current_mode)),
+                   LOG_STR_ARG(climate_mode_to_string(id(previous_climate_mode))),
+                   id(mildew_proof_mode_active), id(mildew_proof_auto_delay_active),
+                   id(state_change_count));
+
+          // ========================================
+          // SECTION 5: USER INTERRUPTION HANDLING
+          // ========================================
+
+          // Cancel mildew proof if user changed mode
+          if (id(mildew_proof_mode_active) && current_mode != CLIMATE_MODE_FAN_ONLY) {
+            ESP_LOGI("mildew_proof", "User interrupted mildew proof (mode changed to %s), cancelling", LOG_STR_ARG(climate_mode_to_string(current_mode)));
+            id(mildew_proof_mode_active) = false;
+            id(mildew_proof_process).stop();
+          }
+
+          // Cancel delay if user turned on climate during delay
+          if (id(mildew_proof_auto_delay_active) && current_mode != CLIMATE_MODE_OFF) {
+            ESP_LOGI("mildew_proof", "Climate turned on during delay, cancelling");
+            id(mildew_proof_auto_delay_active) = false;
+            id(start_mildew_proof_mode_with_delay).stop();
+          }
+
+          // ========================================
+          // SECTION 6: MILDEW PROOF TRIGGERING
+          // ========================================
+
+          // Update state tracking
+          ClimateMode previous_mode = id(previous_climate_mode);
+          id(previous_climate_mode) = current_mode;
+
+          // Trigger mildew proof on OFF state
+          if (current_mode == CLIMATE_MODE_OFF && previous_mode != CLIMATE_MODE_OFF &&
+              id(mildew_proof_auto_enabled).state && !id(mildew_proof_auto_delay_active)) {
+            ESP_LOGI("mildew_proof", "Climate OFF from %s, checking if mode needs protection", LOG_STR_ARG(climate_mode_to_string(previous_mode)));
+
+            if (id(is_active_mode_fn)(previous_mode, id(mildew_proof_modes).state)) {
+              ESP_LOGI("mildew_proof", "Starting delay for %s mode", LOG_STR_ARG(climate_mode_to_string(previous_mode)));
+              id(start_mildew_proof_mode_with_delay).execute();
+            } else {
+              ESP_LOGD("mildew_proof", "Previous mode %s not in active modes, skipping", LOG_STR_ARG(climate_mode_to_string(previous_mode)));
+            }
+          }
+
+          // ========================================
+          // CLEANUP
+          // ========================================
+
+          // Ensure flag is reset in case of any early returns
+          id(mildew_proof_internal_action) = false;
+
+  - id: start_mildew_proof_mode_with_delay
+    then:
+      - lambda: |-
+          if (id(mildew_proof_mode_active) || id(mildew_proof_auto_delay_active)) {
+            ESP_LOGW("mildew_proof", "Mildew proof process or delay already active, ignoring request");
+            return;
+          }
+          ESP_LOGI("mildew_proof", "Starting mildew proof delay timer");
+          id(mildew_proof_auto_delay_active) = true;
+      - delay: !lambda return (int)(id(mildew_proof_auto_delay).state * 1000);
+      - lambda: |-
+          id(mildew_proof_auto_delay_active) = false;
+          // Check if climate is still OFF and no other mildew proof is running
+          if (id($climate_id).mode == CLIMATE_MODE_OFF && !id(mildew_proof_mode_active)) {
+            ESP_LOGI("mildew_proof", "Delay completed, starting mildew proof process");
+            id(mildew_proof_process).execute();
+          } else {
+            ESP_LOGI("mildew_proof", "Climate state changed during delay, cancelling mildew proof");
+          }
+
+  - id: start_mildew_proof_mode
+    then:
+      - lambda: |-
+          // Check if any mildew proof activity is ongoing
+          if (id(mildew_proof_mode_active) || id(mildew_proof_auto_delay_active) || id(mildew_proof_process).is_running()) {
+            ESP_LOGW("mildew_proof", "Mildew proof system busy, ignoring manual request");
+            return;
+          }
+
+          ClimateMode current_mode = id($climate_id).mode;
+          if (id(is_active_mode_fn)(current_mode, id(mildew_proof_modes).state)) {
+            ESP_LOGI("mildew_proof", "Manually starting mildew proof for mode: %s", LOG_STR_ARG(climate_mode_to_string(current_mode)));
+            id(mildew_proof_process).execute();
+          } else {
+            ESP_LOGI("mildew_proof", "Mode %s not in active modes, skipping", LOG_STR_ARG(climate_mode_to_string(current_mode)));
+          }
+
+  - id: cancel_mildew_proof
+    then:
+      - lambda: |-
+          if (id(mildew_proof_mode_active)) {
+            ESP_LOGI("mildew_proof", "Manually cancelling active mildew proof process");
+            id(mildew_proof_mode_active) = false;
+            id(mildew_proof_process).stop();
+
+            id(mildew_proof_internal_action) = true;
+            auto call = id($climate_id).make_call();
+            call.set_mode(CLIMATE_MODE_OFF);
+            call.perform();
+          } else if (id(mildew_proof_auto_delay_active)) {
+            ESP_LOGI("mildew_proof", "Manually cancelling mildew proof delay");
+            id(mildew_proof_auto_delay_active) = false;
+            id(start_mildew_proof_mode_with_delay).stop();
+          } else {
+            ESP_LOGW("mildew_proof", "No active mildew proof process or delay to cancel");
+          }
+
+  - id: mildew_proof_process
+    then:
+      - lambda: |-
+          if (id(mildew_proof_mode_active)) {
+            ESP_LOGW("mildew_proof", "Mildew proof already active, ignoring duplicate request");
+            return;
+          }
+
+          ESP_LOGI("mildew_proof", "Starting mildew proof process");
+          id(mildew_proof_mode_active) = true;
+          id(mildew_proof_start_time) = millis() / 1000;
+
+          id(mildew_proof_internal_action) = true;
+          auto call = id($climate_id).make_call();
+          call.set_mode(CLIMATE_MODE_FAN_ONLY);
+          call.perform();
+      - delay: !lambda return (int)(id(mildew_proof_duration).state * 60 * 1000);
+      - lambda: |-
+          if (!id(mildew_proof_mode_active)) {
+            ESP_LOGW("mildew_proof", "Mildew proof was cancelled during execution");
+            return;
+          }
+
+          ESP_LOGI("mildew_proof", "Mildew proof process completed, turning off");
+          id(mildew_proof_mode_active) = false;
+
+          id(mildew_proof_internal_action) = true;
+          auto call = id($climate_id).make_call();
+          call.set_mode(CLIMATE_MODE_OFF);
+          call.perform();
