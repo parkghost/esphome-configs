@@ -1,4 +1,3 @@
-
 # =========================================
 # MILDEW PROOF PACKAGE
 # =========================================
@@ -24,7 +23,7 @@
 #      climate_id: "my_climate"  # Your climate entity ID
 #
 #    packages:
-#      mildew_proof: !include common/climate/mildew_proof.yaml
+#      mildew_proof: !include modules/climate/mildew_proof.yaml
 #
 #    climate:
 #      - platform: CLIMATE_PLATFORM
