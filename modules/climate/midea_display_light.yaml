@@ -1,0 +1,23 @@
+# =========================================
+# MIDEA DISPLAY LIGHT PACKAGE
+# =========================================
+#
+# OVERVIEW:
+# ---------
+# Control the display light (LED panel) on Midea air conditioners via UART.
+#
+# INSTALLATION:
+# -------------
+# Add to your ESPHome configuration:
+#
+#    packages:
+#      midea_display_light: !include modules/climate/midea_display_light.yaml
+
+external_components:
+  - source: github://parkghost/esphome@feature/midea-display-light-control-via-uart
+    components: [midea]
+
+switch:
+  - platform: midea
+    display_light:
+      name: "Display Light"
