@@ -1,3 +1,21 @@
+# ESPHome specific
 .esphome
+
+# Python virtual environments
+.venv
+venv/
+
+# Python bytecode and cache
 __pycache__/
-**.pyc
+*.pyc
+*.pyo
+*.pyd
+
+# Python package metadata
+*.egg-info/
+dist/
+build/
+
+# Development and testing
+tests/
+pyproject.toml
