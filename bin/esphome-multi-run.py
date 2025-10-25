@@ -69,6 +69,7 @@ class ExecutionStatus(str, Enum):
     FAILED = "failed"
     INTERRUPTED = "interrupted"
     TIMEOUT = "timeout"
+    OFFLINE = "offline"
 
 
 class FailureType(str, Enum):
@@ -104,6 +105,7 @@ class Color(str, Enum):
     RED = "\033[0;31m"
     GREEN = "\033[0;32m"
     YELLOW = "\033[1;33m"
+    PURPLE = "\033[0;35m"
     BLUE = "\033[0;36m"
     RESET = "\033[0m"
 
@@ -217,12 +219,14 @@ class RunnerConfig:
     files_to_run: list[str]
     exclude_file: Path = Path(".esphome-run-exclude")
     no_logs: bool = True
+    build_path: Path = Path("/data/build")
     parallel_workers: int = 0
     compile_only: bool = False
     log_dir: Path = Path("logs")
     max_retries: int = 3  # Configurable via CLI
     slow_start_interval: float = 5.0  # Default when .esphome is empty (0 = disabled)
     enable_failure_analysis: bool = True  # Enable smart failure detection (skip retry on config errors)
+    force: bool = False
 
     # Constants
     RETRY_DELAY_SECONDS: float = 3.0  # Deprecated: use RETRY_BASE_DELAY
@@ -354,6 +358,7 @@ class ExecutionStats:
             ExecutionStatus.FAILED,
             ExecutionStatus.INTERRUPTED,
             ExecutionStatus.TIMEOUT,
+            ExecutionStatus.OFFLINE,
         }
         completed = sum(status_counts[status] for status in completed_statuses)
 
@@ -990,6 +995,8 @@ class ResultSummaryRenderer:
                 return "✓ success"
             elif cell == "failed":
                 return "✗ failed"
+            elif cell == "offline":
+                return "⚠ offline"
             elif cell == "interrupted":
                 return "⚠ interrupted"
             else:
@@ -1090,6 +1097,8 @@ class ResultSummaryRenderer:
             return f"{Color.RED.value}✗ failed{Color.RESET.value}"
         elif status == "interrupted":
             return f"{Color.YELLOW.value}⚠ interrupted{Color.RESET.value}"
+        elif status == "offline":
+            return f"{Color.PURPLE.value}⚠ offline{Color.RESET.value}"
         else:
             return f"{Color.YELLOW.value}⚠ skipped{Color.RESET.value}"
 
@@ -1223,6 +1232,10 @@ class SerialProgressDisplay:
             elif status == ExecutionStatus.INTERRUPTED:
                 print_color(
                     Color.YELLOW, f"⚠ [{number}] {file_path} (interrupted){time_str}"
+                )
+            elif status == ExecutionStatus.OFFLINE:
+                print_color(
+                    Color.PURPLE, f"⚠ [{number}] {file_path} (offline){time_str}"
                 )
 
         print("=" * 50 + "\n")
@@ -1689,6 +1702,7 @@ class ProcessManager:
     def run_with_pty(
         self,
         file_path: str,
+        build_path: Path,
         log_path: Path,
         retry_count: int = 0,
         interrupted: bool = False,
@@ -1713,6 +1727,9 @@ class ProcessManager:
             start_time=time.time(),
             retry_count=retry_count,
         )
+
+        if build_path:
+            os.environ['ESPHOME_BUILD_PATH'] = f"{build_path}"
 
         fd = None  # Initialize fd to ensure cleanup in finally block
         try:
@@ -1834,6 +1851,7 @@ class ProcessManager:
     def run_with_subprocess(
         self,
         file_path: str,
+        build_path: Path,
         log_path: Path,
         retry_count: int = 0,
         start_time: float | None = None,
@@ -1859,6 +1877,10 @@ class ProcessManager:
             retry_count=retry_count,
         )
 
+        esphome_env = os.environ.copy()
+        if build_path:
+            esphome_env["ESPHOME_BUILD_PATH"] = f"{build_path}"
+
         try:
             log_mode = "a" if retry_count > 0 else "w"
             with open(log_path, log_mode) as log_file:
@@ -1875,6 +1897,7 @@ class ProcessManager:
                     stderr=subprocess.STDOUT,
                     text=True,
                     bufsize=1,
+                    env=esphome_env
                 )
 
                 # Track running process (thread-safe)
@@ -2202,10 +2225,31 @@ class SerialExecutor:
             ExecutionResult with execution details
         """
         file = Path(file_path)
+        basename = Path(file_path).stem
+        with open(file, "r") as f_in:
+            for line in f_in.readline():
+                if "devicename:" in line:
+                    basename = line.split(":")[1].rstrip().strip()
+                    break
+
+        build_path = self.config.build_path
         # Preserve directory structure in logs
         log_path = self.config.log_dir / file.with_suffix('.log')
         # Ensure parent directory exists
         log_path.parent.mkdir(parents=True, exist_ok=True)
+
+        param = '-n' if sys.platform.lower() == 'win32' else '-c'
+
+        if not self.config.force:
+            command = ['ping', param, '1', f"{basename}.local"]
+            response = subprocess.call(
+                command,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.STDOUT)
+            if response != 0:
+                return create_execution_result(
+                    status=ExecutionStatus.OFFLINE
+                )
 
         print("=" * 50)
         print_color(Color.BLUE, f"Running: {file_path}")
@@ -2214,7 +2258,7 @@ class SerialExecutor:
         print("=" * 50)
 
         result = self.process_manager.run_with_pty(
-            file_path, log_path, retry_count, self.interrupted
+            file_path, build_path, log_path, retry_count, self.interrupted
         )
 
         return result
@@ -2536,13 +2580,34 @@ class ParallelExecutor:
             ExecutionResult with execution details
         """
         file = Path(file_path)
+        basename = Path(file_path).stem
+        with open(file, "") as f_in:
+            for line in f_in.readline():
+                if "devicename:" in line:
+                    basename = line.split(":")[1].rstrip().strip()
+                    break
+
         # Preserve directory structure in logs
         log_path = self.config.log_dir / file.with_suffix('.log')
+        build_path = self.config.build_path
         # Ensure parent directory exists
         log_path.parent.mkdir(parents=True, exist_ok=True)
 
+        param = '-n' if sys.platform.lower() == 'win32' else '-c'
+
+        if not self.config.force:
+            command = ['ping', param, '1', f"{basename}.local"]
+            response = subprocess.call(
+                command,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.STDOUT)
+            if response != 0:
+                return create_execution_result(
+                    status=ExecutionStatus.OFFLINE
+                )
+
         result = self.process_manager.run_with_subprocess(
-            file_path, log_path, retry_count, start_time
+            file_path, build_path, log_path, retry_count, start_time
         )
 
         return result
@@ -2904,6 +2969,12 @@ DIRECTORY STRUCTURE:
     )
 
     parser.add_argument(
+        "-b",
+        "--build_path",
+        help="Set the specified directory to ESPHOME_BUILD_PATH\n"
+    )
+
+    parser.add_argument(
         "--logs",
         action="store_true",
         help="Enable log monitoring after upload\n"
@@ -2964,6 +3035,14 @@ DIRECTORY STRUCTURE:
         "Use this flag to retry all failures regardless of error type.",
     )
 
+    parser.add_argument(
+        "-f",
+        "--force",
+        action="store_true",
+        help="Skip check the device Online or Not\n"
+        "If the device is not online, still compile or run\n",
+    )
+
     return parser.parse_args()
 
 
@@ -3012,7 +3091,7 @@ def validate_arguments(args: argparse.Namespace, files: list[str]) -> None:
         sys.exit(1)
 
 
-def is_esphome_cache_empty(files_to_run: list[str]) -> bool:
+def is_esphome_cache_empty(build_path, files_to_run: list[str]) -> bool:
     """Check if .esphome directories are empty for the given files.
 
     Uses aggressive strategy: returns False if ANY .esphome directory
@@ -3030,22 +3109,14 @@ def is_esphome_cache_empty(files_to_run: list[str]) -> bool:
         False if any .esphome directory has content (skip slow start)
 
     Examples:
-        >>> is_esphome_cache_empty(["examples/Brand/Category/climate.yaml"])
+        >>> is_esphome_cache_empty(examples/Brand/Category/.esphome, ["examples/Brand/Category/climate.yaml"])
         # Checks examples/Brand/Category/.esphome/
     """
     if not files_to_run:
         return True  # No files, use slow start (safe default)
 
-    # Get unique directories containing the YAML files
-    yaml_dirs = set()
-    for file_path in files_to_run:
-        yaml_dir = Path(file_path).parent
-        yaml_dirs.add(yaml_dir)
-
-    # Check each directory's .esphome (aggressive strategy)
-    for yaml_dir in yaml_dirs:
-        esphome_dir = yaml_dir / ".esphome"
-
+    if build_path:
+        esphome_dir = Path(build_path).parent
         # Has .esphome directory?
         if esphome_dir.exists():
             try:
@@ -3054,7 +3125,27 @@ def is_esphome_cache_empty(files_to_run: list[str]) -> bool:
                     return False
             except (OSError, PermissionError):
                 # Can't read -> skip this directory, continue checking others
-                continue
+                pass
+    else:
+        # Get unique directories containing the YAML files
+        yaml_dirs = set()
+        for file_path in files_to_run:
+            yaml_dir = Path(file_path).parent
+            yaml_dirs.add(yaml_dir)
+
+        # Check each directory's .esphome (aggressive strategy)
+        for yaml_dir in yaml_dirs:
+            esphome_dir = yaml_dir / ".esphome"
+
+            # Has .esphome directory?
+            if esphome_dir.exists():
+                try:
+                    # Has any cache content -> skip slow start
+                    if any(esphome_dir.iterdir()):
+                        return False
+                except (OSError, PermissionError):
+                    # Can't read -> skip this directory, continue checking others
+                    continue
 
     # All .esphome directories are empty/missing -> use slow start
     return True
@@ -3080,7 +3171,7 @@ def create_runner_config(args: argparse.Namespace, files: list[str]) -> RunnerCo
     # Determine slow_start_interval with dynamic default
     if args.slow_start_interval is None:
         # Dynamic default: 0 if any .esphome has cache, 5.0 if all are empty
-        slow_start_interval = 5.0 if is_esphome_cache_empty(files) else 0.0
+        slow_start_interval = 5.0 if is_esphome_cache_empty(args.build_path, files) else 0.0
     else:
         slow_start_interval = args.slow_start_interval
         # Validate slow_start_interval
@@ -3097,11 +3188,13 @@ def create_runner_config(args: argparse.Namespace, files: list[str]) -> RunnerCo
         files_to_run=files,
         exclude_file=Path(args.exclude_file),
         no_logs=use_no_logs,
+        build_path=args.build_path,
         parallel_workers=args.parallel,
         compile_only=args.compile_only,
         max_retries=args.max_retries,
         slow_start_interval=slow_start_interval,
         enable_failure_analysis=enable_failure_analysis,
+        force=args.force
     )
 
 
