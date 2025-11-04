@@ -45,12 +45,32 @@
 #
 # HOW IT WORKS:
 # -------------
-# 1. AC turns OFF from cooling/heating mode
-# 2. System waits for configured delay (auto mode only)
+# AUTOMATIC MODE (when AC is turned OFF via remote/voice/HA):
+# 1. AC turns OFF from a mode in active modes list (e.g., COOL)
+# 2. System waits for configured delay (1-60 seconds)
 # 3. Switches to FAN_ONLY mode for moisture removal
 # 4. Runs for configured duration
 # 5. Returns to OFF state when complete
-# 6. Can be interrupted by user or manual mode change
+#
+# MANUAL MODE (using "Start Mildew Proof" button):
+# 1. If current mode is in active modes list (e.g., COOL):
+#    - Immediately starts FAN_ONLY mode (no delay)
+#    - Runs for configured duration
+#    - Returns to OFF state when complete
+# 2. If current mode is NOT in active modes list:
+#    - Switches to OFF mode directly (no fan operation)
+#    - Useful for turning off AC without needing mildew protection
+# 3. Once started, pressing "Start Mildew Proof" again will be IGNORED
+#    (shows "system busy" warning) and continues until completion
+# 4. AUTOMATION USE CASE: For automations that turn AC off multiple times
+#    (e.g., presence detection, schedules, leaved), use this mode to trigger mildew
+#    proof. This prevents interruption from subsequent automation-triggered
+#    OFF commands, ensuring the full fan cycle completes.
+#
+# USER INTERRUPTION (applies to BOTH modes):
+# If user changes climate mode during mildew proof process (e.g., turns AC
+# back on, or manually switches to OFF via remote/voice), the mildew proof
+# will STOP immediately to respect user intent.
 #
 # =========================================
 
@@ -395,7 +415,10 @@ script:
             ESP_LOGI("mildew_proof", "Manually starting mildew proof for mode: %s", LOG_STR_ARG(climate_mode_to_string(current_mode)));
             id(mildew_proof_process).execute();
           } else {
-            ESP_LOGI("mildew_proof", "Mode %s not in active modes, skipping", LOG_STR_ARG(climate_mode_to_string(current_mode)));
+            ESP_LOGI("mildew_proof", "Current mode %s is not configured for mildew protection, switching to OFF", LOG_STR_ARG(climate_mode_to_string(current_mode)));
+            auto call = id($climate_id).make_call();
+            call.set_mode(CLIMATE_MODE_OFF);
+            call.perform();
           }
 
   - id: cancel_mildew_proof
