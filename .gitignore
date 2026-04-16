@@ -17,5 +17,10 @@ dist/
 build/
 
 # Development and testing
-tests/
 pyproject.toml
+tests/
+
+# Coverage output
+.coverage
+htmlcov/
+coverage.xml

@@ -26,6 +26,7 @@ Usage:
 import argparse
 import fnmatch
 import glob
+import json
 import logging
 import os
 import pty
@@ -37,10 +38,10 @@ import threading
 import time
 from collections import Counter
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Protocol, TypedDict
+from typing import Any, NamedTuple, Protocol, TypedDict
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -200,7 +201,6 @@ class RunnerConfig:
         compile_only: Whether to skip upload step
         log_dir: Directory for log files
         max_retries: Maximum number of retry attempts (configurable)
-        slow_start_interval: Seconds between task starts in parallel mode
         enable_failure_analysis: Enable smart failure analysis to skip retry on config errors
 
     Constants:
@@ -221,8 +221,17 @@ class RunnerConfig:
     compile_only: bool = False
     log_dir: Path = Path("logs")
     max_retries: int = 3  # Configurable via CLI
-    slow_start_interval: float = 5.0  # Default when .esphome is empty (0 = disabled)
     enable_failure_analysis: bool = True  # Enable smart failure detection (skip retry on config errors)
+
+    # Warmup configuration
+    warmup_enabled: bool = True
+    warmup_cache_dir: Path = field(default_factory=lambda: _default_cache_dir())
+    esphome_version: str = ""
+
+    # Slow-start (independent of warmup): enforces minimum gap between task starts
+    # to mitigate pioarduino's install_esptool() --force-reinstall race on shared
+    # penv/ that runs at the beginning of every compile.
+    slow_start_interval: float = 5.0  # seconds; 0 disables
 
     # Constants
     RETRY_DELAY_SECONDS: float = 3.0  # Deprecated: use RETRY_BASE_DELAY
@@ -237,10 +246,6 @@ class RunnerConfig:
     PROGRESS_BAR_LENGTH: int = 40
     MAX_FILENAME_DISPLAY: int = 60
     MAX_PARALLEL_WORKERS_WARNING: int = 16
-
-    # Slow start configuration for parallel mode (batch sizes are constant)
-    SLOW_START_INITIAL_WORKERS: int = 1  # Start with 1 workers
-    SLOW_START_INCREMENT: int = 1  # Add 1 workers at a time
 
     # Display and timing constants
     DISPLAY_THREAD_TIMEOUT: float = 2.0
@@ -270,6 +275,12 @@ class RunnerConfig:
             "--no-logs" if no_logs is True, empty string otherwise
         """
         return "--no-logs" if self.no_logs else ""
+
+    @property
+    def warmup_cache_path(self) -> Path:
+        """Full path to the version-keyed warmup stamp file."""
+        version = self.esphome_version or "unknown"
+        return self.warmup_cache_dir / f"warmed-{version}"
 
     def calculate_retry_delay(self, retry_count: int) -> float:
         """Calculate retry delay using exponential backoff.
@@ -434,6 +445,182 @@ def print_color(color: Color, message: str) -> None:
         message: Message to print
     """
     print(f"{color.value}{message}{Color.RESET.value}")
+
+
+def _default_cache_dir() -> Path:
+    """Return the OS-native user cache directory for esphome-multi-run.
+
+    Linux / *BSD: respects XDG_CACHE_HOME, falls back to ~/.cache.
+    macOS: ~/Library/Caches.
+    Windows: %LOCALAPPDATA%, falls back to ~/AppData/Local.
+    """
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Caches" / "esphome-multi-run"
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA")
+        if base:
+            return Path(base) / "esphome-multi-run" / "Cache"
+        return Path.home() / "AppData" / "Local" / "esphome-multi-run" / "Cache"
+    # Linux / other Unix: XDG Base Directory Spec
+    xdg = os.environ.get("XDG_CACHE_HOME")
+    base = Path(xdg) if xdg else Path.home() / ".cache"
+    return base / "esphome-multi-run"
+
+
+def get_esphome_version() -> str:
+    """Probe ESPHome CLI for its version string.
+
+    Returns the version number (e.g. '2026.4.0') or 'unknown' if the
+    esphome binary cannot be invoked or its output is unparseable.
+    Used to key the warmup cache stamp so a stamp from one ESPHome
+    version is not reused across an upgrade.
+    """
+    try:
+        result = subprocess.run(
+            ["esphome", "version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return "unknown"
+    if result.returncode != 0:
+        return "unknown"
+    output = result.stdout.strip()
+    # Accept "Version: 2026.4.0" or "2026.4.0"
+    prefix = "Version:"
+    if output.lower().startswith(prefix.lower()):
+        output = output[len(prefix):].strip()
+    return output or "unknown"
+
+
+class BucketKey(NamedTuple):
+    """Toolchain bucket identity for grouping yamls during warmup.
+
+    Two yamls with the same BucketKey exercise the same PlatformIO
+    toolchain + framework installation path, so compiling one of them
+    warms the cache for all.
+    """
+    platform: str          # "esp32" / "esp8266" / "rp2040" / "default"
+    chip_variant: str      # "ESP32" / "ESP32S3" / "ESP32C3" / ... or platform fallback
+    framework_type: str    # "esp-idf" / "arduino" / "default"
+    framework_version: str # "recommended" / "latest" / URL / "default"
+
+
+_KNOWN_PLATFORMS = ("esp32", "esp8266", "rp2040", "bk72xx", "rtl87xx",
+                    "libretiny", "host")
+
+
+def _find_field(lines: list[str], path: tuple[str, ...]) -> str | None:
+    """Walk a YAML text by 2-space indentation to retrieve a scalar leaf.
+
+    `path` is a tuple of keys, e.g. ('esp32', 'framework', 'type').
+    Returns the string value at that path, or None if not present.
+    """
+    depth = 0
+    i = 0
+    current_indent = 0
+    while i < len(lines) and depth < len(path):
+        line = lines[i]
+        if not line.strip() or line.lstrip().startswith("#"):
+            i += 1
+            continue
+        indent = len(line) - len(line.lstrip())
+        expected_indent = depth * 2
+        stripped = line.strip()
+        if indent < current_indent and depth > 0:
+            # Left the sub-tree we were descending into without finding the key.
+            return None
+        if indent == expected_indent and stripped.startswith(f"{path[depth]}:"):
+            if depth == len(path) - 1:
+                value = stripped.split(":", 1)[1].strip()
+                return value if value else None
+            depth += 1
+            current_indent = (depth) * 2
+            i += 1
+            continue
+        i += 1
+    return None
+
+
+def extract_bucket_fields(resolved_config: str) -> BucketKey:
+    """Extract the toolchain bucket key from `esphome config` output.
+
+    Only reads user-facing top-level keys (esp32, esp8266, rp2040, ...)
+    and their immediate framework / variant sub-fields. No internal
+    ESPHome tables are consulted.
+    """
+    lines = resolved_config.splitlines()
+    platform = "default"
+    for candidate in _KNOWN_PLATFORMS:
+        for line in lines:
+            if line.startswith(f"{candidate}:"):
+                platform = candidate
+                break
+        if platform != "default":
+            break
+    if platform == "default":
+        return BucketKey("default", "default", "default", "default")
+
+    variant = _find_field(lines, (platform, "variant")) or platform
+    framework_type = _find_field(lines, (platform, "framework", "type"))
+    framework_version = _find_field(lines, (platform, "framework", "version"))
+
+    # esp8266 has no framework.type in config; it's always arduino.
+    if framework_type is None and platform == "esp8266":
+        framework_type = "arduino"
+    if framework_type is None:
+        framework_type = "default"
+    if framework_version is None:
+        # rp2040 uses framework.platform_version instead of .version
+        framework_version = _find_field(lines, (platform, "framework", "platform_version")) or "default"
+
+    return BucketKey(platform, variant, framework_type, framework_version)
+
+
+def probe_bucket(file_path: str, timeout: float = 60.0) -> BucketKey:
+    """Resolve a yaml's toolchain bucket by invoking `esphome config`.
+
+    Returns the default 'unknown' bucket on any failure; failures are
+    intentionally swallowed here so warmup can still proceed with a
+    best-effort grouping. The parallel phase will surface real config
+    errors on its own pass.
+    """
+    try:
+        result = subprocess.run(
+            ["esphome", "config", file_path],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return BucketKey("default", "default", "default", "default")
+    if result.returncode != 0:
+        return BucketKey("default", "default", "default", "default")
+    return extract_bucket_fields(result.stdout)
+
+
+def read_warmup_stamp(stamp_path: Path) -> bool:
+    """Return True if the warmup stamp exists at `stamp_path`.
+
+    Content is intentionally not validated — presence is the signal.
+    """
+    return stamp_path.is_file()
+
+
+def write_warmup_stamp(stamp_path: Path, version: str, buckets: list[str]) -> bool:
+    """Write a diagnostic stamp file. Returns True on success, False on IO error."""
+    payload = {
+        "version": version,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "buckets": buckets,
+    }
+    try:
+        stamp_path.parent.mkdir(parents=True, exist_ok=True)
+        stamp_path.write_text(json.dumps(payload), encoding="utf-8")
+        return True
+    except OSError:
+        return False
 
 
 def strip_ansi(text: str) -> str:
@@ -767,13 +954,21 @@ class ResultTracker:
         self.overall_end_time: float | None = None
 
     def initialize_results(self, files: list[str]) -> None:
-        """Initialize all files with PENDING status.
+        """Initialize each file's entry to PENDING, preserving any prior SUCCESS.
+
+        Re-init is idempotent for files already marked SUCCESS (e.g. by
+        the warmup phase). Other existing statuses are reset to PENDING
+        because this is called before each execution batch and stale
+        FAILED/IN_PROGRESS entries should not leak forward.
 
         Args:
             files: List of file paths to initialize
         """
         with self.results_lock:
             for file_path in files:
+                existing = self.results.get(file_path)
+                if existing is not None and existing["status"] == ExecutionStatus.SUCCESS:
+                    continue
                 self.results[file_path] = create_execution_result(
                     status=ExecutionStatus.PENDING
                 )
@@ -820,6 +1015,224 @@ class ResultTracker:
 
         with self.results_lock:
             return copy.deepcopy(self.results)
+
+
+@dataclass
+class WarmupResult:
+    """Outcome of serially compiling warmup representatives."""
+    attempted: list[str] = field(default_factory=list)
+    failures: list[str] = field(default_factory=list)
+
+    @property
+    def success(self) -> bool:
+        return not self.failures
+
+
+@dataclass
+class WarmupOutcome:
+    """High-level outcome of the whole warmup phase."""
+    disabled: bool = False          # --disable-warmup was set
+    cache_hit: bool = False         # stamp existed, warmup skipped
+    reps_compiled: list[str] = field(default_factory=list)
+    buckets: list[str] = field(default_factory=list)
+    success: bool = True            # False if any rep failed; stamp not written
+
+
+class WarmupPhase:
+    """Serial pre-compile of one representative per toolchain bucket.
+
+    Groups the filtered file list by BucketKey, picks one file per
+    bucket, and compiles the representatives sequentially via
+    `esphome compile` so that PlatformIO's package cache is populated
+    before any parallel worker starts.
+    """
+
+    def __init__(self, config: "RunnerConfig"):
+        self.config = config
+
+    def probe_buckets(self, files: list[str]) -> dict["BucketKey", list[str]]:
+        """Run `esphome config` on each file (parallel), group by BucketKey.
+
+        Streams live `probed N/M` progress on a single overwritten terminal
+        line so the user sees the phase advancing instead of a stuck prompt.
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        workers = max(1, self.config.parallel_workers or 1)
+        total = len(files)
+        buckets: dict[BucketKey, list[str]] = {}
+        # Preserve input order in bucket values; we re-append in original order after.
+        results: dict[str, BucketKey] = {}
+
+        is_tty = sys.stdout.isatty()
+        prefix = f"  Probing {total} yaml(s)..."
+        if is_tty:
+            sys.stdout.write(prefix)
+            sys.stdout.flush()
+
+        def _report(done: int, final: bool = False) -> None:
+            if is_tty:
+                sys.stdout.write(f"\r{prefix} {done}/{total}\x1b[K")
+                if final:
+                    sys.stdout.write("\n")
+                sys.stdout.flush()
+            elif final:
+                sys.stdout.write(f"{prefix} {done}/{total}\n")
+                sys.stdout.flush()
+
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            future_to_file = {ex.submit(probe_bucket, f): f for f in files}
+            done = 0
+            _report(done)
+            for future in as_completed(future_to_file):
+                done += 1
+                file_path = future_to_file[future]
+                results[file_path] = future.result()
+                _report(done)
+            _report(done, final=True)
+
+        for file_path in files:  # preserve input order within each bucket
+            bk = results[file_path]
+            buckets.setdefault(bk, []).append(file_path)
+        return buckets
+
+    def select_representatives(
+        self, buckets: dict["BucketKey", list[str]]
+    ) -> list[str]:
+        """Pick one file per bucket.
+
+        Strategy: first file in each bucket after sorting alphabetically.
+        Deterministic and cheap; any file from a bucket warms the same
+        toolchain.
+        """
+        reps = []
+        for bk in sorted(buckets.keys()):
+            files_in_bucket = buckets[bk]
+            if files_in_bucket:
+                reps.append(sorted(files_in_bucket)[0])
+        return reps
+
+    def run_serial(self, reps: list[str]) -> WarmupResult:
+        """Compile each representative sequentially with `esphome compile`.
+
+        Subprocess output is redirected to per-rep log files under
+        `config.log_dir`; the terminal shows one line per rep that
+        transitions from `compiling...` to `✓ 45.2s` / `✗ 32.1s` in place.
+        """
+        result = WarmupResult()
+        log_dir = self.config.log_dir
+        try:
+            log_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass  # write will fail gracefully below if dir is unreachable
+
+        total = len(reps)
+        is_tty = sys.stdout.isatty()
+
+        for idx, rep in enumerate(reps, 1):
+            result.attempted.append(rep)
+            cmd = ["esphome", "compile", rep]
+            log_path = log_dir / f"{Path(rep).stem}-warmup.log"
+            prefix = f"    [{idx}/{total}] {rep}"
+
+            # In-progress indicator
+            if is_tty:
+                sys.stdout.write(f"{prefix}  compiling...")
+                sys.stdout.flush()
+            else:
+                print(f"{prefix}  compiling...  (log: {log_path})")
+
+            start = time.monotonic()
+            try:
+                with open(log_path, "w", encoding="utf-8") as log_file:
+                    proc = subprocess.run(
+                        cmd,
+                        stdout=log_file,
+                        stderr=subprocess.STDOUT,
+                    )
+            except (FileNotFoundError, KeyboardInterrupt, OSError):
+                result.failures.append(rep)
+                if is_tty:
+                    sys.stdout.write(f"\r{prefix}  ✗ interrupted\x1b[K\n")
+                    sys.stdout.flush()
+                else:
+                    print(f"{prefix}  ✗ interrupted")
+                break
+            elapsed = time.monotonic() - start
+
+            if proc.returncode != 0:
+                result.failures.append(rep)
+                final = f"{prefix}  ✗ {elapsed:.1f}s  (see {log_path})"
+            else:
+                final = f"{prefix}  ✓ {elapsed:.1f}s"
+
+            if is_tty:
+                # \x1b[K = erase to end of line (clears any "compiling..." tail)
+                sys.stdout.write(f"\r{final}\x1b[K\n")
+                sys.stdout.flush()
+            else:
+                print(final)
+        return result
+
+    def run(self, files: list[str]) -> WarmupOutcome:
+        """Full warmup flow. Respects stamp, --disable-warmup, and failures."""
+        outcome = WarmupOutcome()
+        if not self.config.warmup_enabled:
+            outcome.disabled = True
+            return outcome
+
+        stamp = self.config.warmup_cache_path
+        if read_warmup_stamp(stamp):
+            outcome.cache_hit = True
+            return outcome
+
+        print_color(Color.BLUE, "Warmup phase:")
+        buckets = self.probe_buckets(files)
+        reps = self.select_representatives(buckets)
+        outcome.buckets = ["/".join(bk) for bk in sorted(buckets.keys())]
+        if not reps:
+            outcome.success = True
+            return outcome
+
+        # Build rep → bucket map for display (select_representatives picks the
+        # alphabetically-first file per bucket, so we recompute the same mapping).
+        rep_by_bucket = {bk: sorted(bucket_files)[0]
+                         for bk, bucket_files in buckets.items() if bucket_files}
+        sorted_keys = sorted(rep_by_bucket.keys())
+        bucket_label_width = max(
+            (len("/".join(bk)) for bk in sorted_keys), default=0
+        )
+        print_color(Color.BLUE, f"  {len(reps)} toolchain bucket(s) detected:")
+        for bk in sorted_keys:
+            label = "/".join(bk).ljust(bucket_label_width)
+            print_color(Color.BLUE, f"    {label}  →  {rep_by_bucket[bk]}")
+        print_color(
+            Color.BLUE,
+            "  Compiling representatives serially "
+            "(PIO output redirected to logs/*-warmup.log):"
+        )
+        serial_result = self.run_serial(reps)
+        outcome.reps_compiled = [r for r in serial_result.attempted
+                                 if r not in serial_result.failures]
+        outcome.success = serial_result.success
+
+        if outcome.success:
+            written = write_warmup_stamp(
+                stamp,
+                version=self.config.esphome_version or "unknown",
+                buckets=outcome.buckets,
+            )
+            if not written:
+                print_color(
+                    Color.YELLOW,
+                    f"Warning: could not write warmup stamp at {stamp}"
+                )
+        else:
+            print_color(
+                Color.YELLOW,
+                f"Warmup: {len(serial_result.failures)} rep(s) failed; "
+                "parallel phase will surface their errors"
+            )
+        return outcome
 
 
 class ResultSummaryRenderer:
@@ -2152,6 +2565,11 @@ class SerialExecutor:
         Args:
             file_path: Path to file to execute
         """
+        # Skip files already marked SUCCESS by the warmup phase
+        existing = self.result_tracker.get_result(file_path)
+        if existing is not None and existing["status"] == ExecutionStatus.SUCCESS:
+            return
+
         retry_count = 0
         success = False
 
@@ -2265,17 +2683,31 @@ class ParallelExecutor:
         self.result_tracker = result_tracker
         self.progress_display = progress_display
         self.interrupted = False
-
-        # Slow start tracking for execution (not just submission)
+        # Slow-start state: enforce minimum gap between task starts to mitigate
+        # pioarduino's install_esptool() --force-reinstall race on shared penv/.
         self.last_task_start_time: float | None = None
         self.start_time_lock = threading.Lock()
 
-    def execute(self, files: list[str]) -> None:
-        """Execute files in parallel with slow start mechanism.
+    def _wait_for_slow_start(self) -> None:
+        """Block until the slow-start interval has elapsed since the last task start.
 
-        Implements gradual worker ramp-up to avoid initial resource contention.
-        This helps prevent failures caused by multiple workers competing for
-        shared resources like PlatformIO package downloads or build cache.
+        Called at the top of every `_execute_file_with_retry` invocation. Thread-safe
+        via `start_time_lock` — holding the lock while sleeping is intentional, it
+        forces other workers to queue up and stagger their starts.
+        """
+        if self.config.slow_start_interval <= 0:
+            return
+        with self.start_time_lock:
+            if self.last_task_start_time is not None:
+                elapsed = time.time() - self.last_task_start_time
+                if elapsed < self.config.slow_start_interval:
+                    self._interruptible_sleep(
+                        self.config.slow_start_interval - elapsed
+                    )
+            self.last_task_start_time = time.time()
+
+    def execute(self, files: list[str]) -> None:
+        """Execute files in parallel.
 
         Args:
             files: List of file paths to execute
@@ -2297,15 +2729,11 @@ class ParallelExecutor:
                 # Give the display thread time to start
                 time.sleep(self.config.DISPLAY_INITIAL_DELAY)
 
-            # Submit tasks with slow start if enabled
-            if self.config.slow_start_interval > 0 and len(files) > self.config.SLOW_START_INITIAL_WORKERS:
-                futures = self._execute_with_slow_start(executor, files)
-            else:
-                # Submit all tasks immediately (original behavior)
-                futures = {
-                    executor.submit(self._execute_file_with_retry, file_path): file_path
-                    for file_path in files
-                }
+            # Submit all tasks immediately
+            futures = {
+                executor.submit(self._execute_file_with_retry, file_path): file_path
+                for file_path in files
+            }
 
             # Wait for completion
             for future in as_completed(futures):
@@ -2356,106 +2784,20 @@ class ParallelExecutor:
             except Exception:
                 pass
 
-    def _execute_with_slow_start(
-        self,
-        executor: Any,  # ThreadPoolExecutor
-        files: list[str]
-    ) -> dict[Any, str]:  # dict[Future, str]
-        """Submit tasks with gradual ramp-up (slow start).
-
-        Instead of submitting all tasks at once, this method gradually submits
-        tasks in batches. The ThreadPoolExecutor will automatically manage the
-        actual concurrency based on max_workers. This approach helps avoid
-        resource contention during initial compilation (e.g., PlatformIO package
-        downloads, compiler initialization).
-
-        Strategy:
-        1. Submit initial batch of tasks
-        2. Wait SLOW_START_INTERVAL seconds
-        3. Submit next batch of tasks
-        4. Repeat until all tasks are submitted
-
-        Args:
-            executor: ThreadPoolExecutor instance
-            files: List of file paths to execute
-
-        Returns:
-            Dictionary mapping Future objects to file paths
-        """
-        from concurrent.futures import Future
-
-        futures: dict[Future[None], str] = {}
-        files_to_submit = list(files)  # Make a copy to work with
-
-        # Calculate initial batch size
-        initial_batch_size = min(
-            self.config.SLOW_START_INITIAL_WORKERS,
-            len(files)
-        )
-
-        # Submit initial batch
-        for _ in range(initial_batch_size):
-            if files_to_submit and not self.interrupted:
-                file_path = files_to_submit.pop(0)
-                future = executor.submit(self._execute_file_with_retry, file_path)
-                futures[future] = file_path
-
-        # Gradually submit remaining tasks in batches
-        while files_to_submit and not self.interrupted:
-            # Wait before submitting next batch
-            time.sleep(self.config.slow_start_interval)
-
-            # Calculate next batch size
-            next_batch_size = min(
-                self.config.SLOW_START_INCREMENT,
-                len(files_to_submit)
-            )
-
-            # Submit next batch
-            for _ in range(next_batch_size):
-                if files_to_submit and not self.interrupted:
-                    file_path = files_to_submit.pop(0)
-                    future = executor.submit(self._execute_file_with_retry, file_path)
-                    futures[future] = file_path
-
-        return futures
-
-    def _wait_for_slow_start(self) -> None:
-        """Wait to enforce slow start interval between task executions.
-
-        This method ensures that tasks don't start simultaneously, even when
-        workers become available. It enforces a minimum interval between any
-        two task starts, preventing resource contention throughout the entire
-        execution (not just at initial submission).
-
-        The wait is interruptible to maintain responsiveness to Ctrl+C.
-
-        Thread-safe: Uses lock to coordinate across all worker threads.
-        Other threads will wait at the lock until the current thread finishes
-        waiting and updates the last_task_start_time.
-        """
-        if self.config.slow_start_interval <= 0:
-            return
-
-        with self.start_time_lock:
-            # Check if we need to wait
-            if self.last_task_start_time is not None:
-                elapsed = time.time() - self.last_task_start_time
-                if elapsed < self.config.slow_start_interval:
-                    wait_time = self.config.slow_start_interval - elapsed
-                    # Sleep while holding the lock - this blocks other threads
-                    # from starting tasks, which is exactly what we want
-                    self._interruptible_sleep(wait_time)
-
-            # Update last start time
-            self.last_task_start_time = time.time()
-
     def _execute_file_with_retry(self, file_path: str) -> None:
         """Execute a single file with retry logic.
 
         Args:
             file_path: Path to file to execute
         """
+        # Skip files already marked SUCCESS by the warmup phase
+        existing = self.result_tracker.get_result(file_path)
+        if existing is not None and existing["status"] == ExecutionStatus.SUCCESS:
+            return
+
+        # Stagger starts to avoid concurrent pioarduino install_esptool races
+        self._wait_for_slow_start()
+
         retry_count = 0
         last_result = None
 
@@ -2468,8 +2810,6 @@ class ParallelExecutor:
 
             # Determine start_time: preserve from first attempt across retries
             if retry_count == 0:
-                # Enforce slow start interval to prevent simultaneous task starts
-                self._wait_for_slow_start()
                 start_time: float = time.time()
             else:
                 # Safely get start_time from last_result, fallback to current time if missing
@@ -2530,7 +2870,7 @@ class ParallelExecutor:
         Args:
             file_path: Path to file to execute
             retry_count: Current retry attempt
-            start_time: Pre-set start time (from after slow start wait)
+            start_time: Pre-set start time captured before execution
 
         Returns:
             ExecutionResult with execution details
@@ -2701,6 +3041,9 @@ class ESPHomeRunner:
             result_tracker=self.result_tracker,
         )
 
+        # Warmup phase (runs between file-filter and executor dispatch)
+        self.warmup = WarmupPhase(config)
+
         # Files to execute (will be populated after filtering)
         self.files_to_run: list[str] = []
 
@@ -2730,8 +3073,29 @@ class ESPHomeRunner:
         # Step 2: Display execution information
         self._print_header()
 
-        # Step 3: Execute files with timing
+        # Start the wall-clock timer here so the final "Total execution time"
+        # covers the whole run including warmup, not just parallel dispatch.
         self.result_tracker.overall_start_time = time.time()
+
+        # Step 2.5: Warmup phase — populate PIO toolchain cache before parallel dispatch
+        warmup_outcome = self.warmup.run(self.files_to_run)
+        # Seed tracker so parallel phase skips re-compilation.
+        # ResultTracker.initialize_results (called inside executor.execute) preserves
+        # SUCCESS entries on re-init, so seeding here is durable.
+        for rep in warmup_outcome.reps_compiled:
+            self.result_tracker.update_result(
+                rep,
+                create_execution_result(
+                    status=ExecutionStatus.SUCCESS,
+                    retry_count=0,
+                ),
+            )
+        # Warmup guarantees sources are compiled at least once in this version;
+        # opt out of ESPHome's clean step for subsequent builds.
+        if warmup_outcome.success and not warmup_outcome.disabled:
+            os.environ["ESPHOME_SKIP_CLEAN_BUILD"] = "1"
+
+        # Step 3: Execute files
         try:
             self.executor.execute(self.files_to_run)
         finally:
@@ -2754,16 +3118,13 @@ class ESPHomeRunner:
         print_color(Color.BLUE, "ESPHome Multi-Run Script")
 
         if self.config.parallel_workers > 0:
-            # Build parallel mode message with slow start info
-            mode_msg = f"[Parallel Mode - {self.config.parallel_workers} workers"
-
-            if self.config.slow_start_interval > 0:
-                mode_msg += f", Slow Start: {self.config.slow_start_interval:.1f}s interval"
-            else:
-                mode_msg += ", No Slow Start"
-
-            mode_msg += "]"
+            mode_msg = f"[Parallel Mode - {self.config.parallel_workers} workers]"
             print_color(Color.BLUE, mode_msg)
+            if self.config.slow_start_interval > 0:
+                print_color(
+                    Color.BLUE,
+                    f"[Slow start: {self.config.slow_start_interval:.1f}s between task starts]"
+                )
 
         if self.config.compile_only:
             print_color(Color.YELLOW, "[Compile-only mode - no uploads]")
@@ -2779,6 +3140,16 @@ class ESPHomeRunner:
                 Color.YELLOW,
                 "[Smart failure analysis: DISABLED - all errors will retry]"
             )
+
+        # Display warmup status
+        if self.config.warmup_enabled:
+            version = self.config.esphome_version or "unknown"
+            if self.config.warmup_cache_path.is_file():
+                print_color(Color.BLUE, f"[Warmup: cache hit for ESPHome v{version}]")
+            else:
+                print_color(Color.BLUE, f"[Warmup: enabled (ESPHome v{version})]")
+        else:
+            print_color(Color.YELLOW, "[Warmup: disabled]")
 
         print(f"Starting at: {datetime.now()}")
 
@@ -2806,11 +3177,6 @@ EXECUTION MODES:
   Parallel (-j N):   ⚠️  EXPERIMENTAL: N files run simultaneously, output saved to logs/ directory
 
 PARALLEL MODE OPTIMIZATIONS:
-  ✓ Slow Start: Enforces minimum interval between task starts
-    - Dynamic default: 0s if any .esphome has cache, 5s if all .esphome are empty
-    - Prevents multiple tasks from starting simultaneously on first run
-    - Reduces resource contention during package downloads
-    - Set --slow-start-interval 0 to force disable
   ✓ Exponential Backoff: Retry delays increase exponentially (3s → 6s → 12s → ...)
     - Gives system more time to recover from transient failures
     - Reduces retry-induced load
@@ -2861,8 +3227,6 @@ EXCLUSION FILE FORMAT:
 FEATURES:
   ✓ Smart failure analysis (skips retry on config errors, use -F to disable)
   ✓ Exponential backoff retry (configurable with -r/--max-retries, default: 3)
-  ✓ Slow start mechanism for parallel mode (configurable with --slow-start-interval)
-  ✓ Automatic .esphome cache detection (checks each YAML file's directory)
   ✓ Default exclusion patterns (auto-excludes secrets.yaml when no exclude file)
   ✓ Preserves directory structure in logs/ (mirrors your source structure)
   ✓ Color-coded output and progress tracking
@@ -2872,7 +3236,6 @@ FEATURES:
 
 DIRECTORY STRUCTURE:
   Source files:  examples/Brand/Category/climate.yaml
-  Cache check:   examples/Brand/Category/.esphome/
   Log output:    logs/examples/Brand/Category/climate.log
 """
     parser = argparse.ArgumentParser(
@@ -2947,21 +3310,41 @@ DIRECTORY STRUCTURE:
     )
 
     parser.add_argument(
-        "--slow-start-interval",
-        type=float,
-        default=None,
-        metavar="SECONDS",
-        help="Seconds between task starts in parallel mode\n"
-        "(default: 0 if any .esphome has cache, 5.0 if all .esphome are empty)",
-    )
-
-    parser.add_argument(
         "-F",
         "--disable-failure-analysis",
         action="store_true",
         help="Disable smart failure analysis (retry all failures)\n"
         "By default, configuration errors skip retry to save time.\n"
         "Use this flag to retry all failures regardless of error type.",
+    )
+
+    parser.add_argument(
+        "--disable-warmup",
+        action="store_true",
+        help="Skip the toolchain warmup phase.\n"
+        "By default, before parallel compilation a small number of\n"
+        "representative configs are compiled serially to populate the\n"
+        "PlatformIO toolchain cache, avoiding concurrent-extraction\n"
+        "races. Use this to turn it off.",
+    )
+
+    parser.add_argument(
+        "--warmup-cache-dir",
+        default=None,
+        metavar="PATH",
+        help="Override the warmup cache stamp directory\n"
+        "(default: OS-native user cache directory)",
+    )
+
+    parser.add_argument(
+        "--slow-start-interval",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="Minimum gap (seconds) between parallel task starts.\n"
+        "Default: 5.0. Mitigates pioarduino's install_esptool() race\n"
+        "where concurrent compiles can delete penv/bin/esptool mid-install.\n"
+        "Set to 0 to disable.",
     )
 
     return parser.parse_args()
@@ -3012,54 +3395,6 @@ def validate_arguments(args: argparse.Namespace, files: list[str]) -> None:
         sys.exit(1)
 
 
-def is_esphome_cache_empty(files_to_run: list[str]) -> bool:
-    """Check if .esphome directories are empty for the given files.
-
-    Uses aggressive strategy: returns False if ANY .esphome directory
-    has cache content, disabling slow start for faster execution.
-
-    This function checks each YAML file's directory for a .esphome cache
-    directory. If any file's directory has cache, slow start is disabled
-    to allow immediate parallel execution.
-
-    Args:
-        files_to_run: List of YAML files to check
-
-    Returns:
-        True if all .esphome directories are empty/missing (use slow start)
-        False if any .esphome directory has content (skip slow start)
-
-    Examples:
-        >>> is_esphome_cache_empty(["examples/Brand/Category/climate.yaml"])
-        # Checks examples/Brand/Category/.esphome/
-    """
-    if not files_to_run:
-        return True  # No files, use slow start (safe default)
-
-    # Get unique directories containing the YAML files
-    yaml_dirs = set()
-    for file_path in files_to_run:
-        yaml_dir = Path(file_path).parent
-        yaml_dirs.add(yaml_dir)
-
-    # Check each directory's .esphome (aggressive strategy)
-    for yaml_dir in yaml_dirs:
-        esphome_dir = yaml_dir / ".esphome"
-
-        # Has .esphome directory?
-        if esphome_dir.exists():
-            try:
-                # Has any cache content -> skip slow start
-                if any(esphome_dir.iterdir()):
-                    return False
-            except (OSError, PermissionError):
-                # Can't read -> skip this directory, continue checking others
-                continue
-
-    # All .esphome directories are empty/missing -> use slow start
-    return True
-
-
 def create_runner_config(args: argparse.Namespace, files: list[str]) -> RunnerConfig:
     """Create RunnerConfig from command-line arguments.
 
@@ -3077,21 +3412,27 @@ def create_runner_config(args: argparse.Namespace, files: list[str]) -> RunnerCo
     if args.max_retries < 0:
         raise ConfigurationError(f"max_retries must be non-negative, got: {args.max_retries}")
 
-    # Determine slow_start_interval with dynamic default
-    if args.slow_start_interval is None:
-        # Dynamic default: 0 if any .esphome has cache, 5.0 if all are empty
-        slow_start_interval = 5.0 if is_esphome_cache_empty(files) else 0.0
-    else:
-        slow_start_interval = args.slow_start_interval
-        # Validate slow_start_interval
-        if slow_start_interval < 0:
-            raise ConfigurationError(f"slow_start_interval must be non-negative, got: {slow_start_interval}")
-
     # Invert the logic: --no-logs is the default, --logs disables it
     use_no_logs = not args.logs
 
     # Invert the logic: failure analysis enabled by default, --disable-failure-analysis disables it
     enable_failure_analysis = not args.disable_failure_analysis
+
+    # Warmup wiring: enabled by default, --disable-warmup turns it off
+    warmup_enabled = not args.disable_warmup
+    if args.warmup_cache_dir:
+        warmup_cache_dir = Path(args.warmup_cache_dir)
+    else:
+        warmup_cache_dir = _default_cache_dir()
+    esphome_version = get_esphome_version()
+
+    slow_start_interval = (
+        args.slow_start_interval if args.slow_start_interval is not None else 5.0
+    )
+    if slow_start_interval < 0:
+        raise ConfigurationError(
+            f"slow_start_interval must be non-negative, got: {slow_start_interval}"
+        )
 
     return RunnerConfig(
         files_to_run=files,
@@ -3100,8 +3441,11 @@ def create_runner_config(args: argparse.Namespace, files: list[str]) -> RunnerCo
         parallel_workers=args.parallel,
         compile_only=args.compile_only,
         max_retries=args.max_retries,
-        slow_start_interval=slow_start_interval,
         enable_failure_analysis=enable_failure_analysis,
+        warmup_enabled=warmup_enabled,
+        warmup_cache_dir=warmup_cache_dir,
+        esphome_version=esphome_version,
+        slow_start_interval=slow_start_interval,
     )
 
 
