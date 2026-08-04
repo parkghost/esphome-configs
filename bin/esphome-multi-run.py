@@ -41,7 +41,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, NamedTuple, Protocol, TypedDict
+from typing import Any, NamedTuple, TypedDict
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -53,16 +53,7 @@ logger = logging.getLogger(__name__)
 
 
 class ExecutionStatus(str, Enum):
-    """Status enumeration for execution results.
-
-    Attributes:
-        PENDING: Task has not started yet
-        IN_PROGRESS: Task is currently running
-        SUCCESS: Task completed successfully
-        FAILED: Task completed with errors
-        INTERRUPTED: Task was interrupted by user
-        TIMEOUT: Task exceeded timeout limit
-    """
+    """Status enumeration for execution results."""
 
     PENDING = "pending"
     IN_PROGRESS = "in_progress"
@@ -77,13 +68,6 @@ class FailureType(str, Enum):
 
     Used to distinguish between permanent errors (configuration issues)
     and transient errors (network/resource issues) to optimize retry strategy.
-
-    Attributes:
-        PERMANENT: Permanent error that won't be fixed by retry
-                  (e.g., YAML syntax error, file not found)
-        TRANSIENT: Transient error that might be fixed by retry
-                  (e.g., network timeout, resource contention)
-        UNKNOWN: Unknown failure type, retry conservatively
     """
 
     PERMANENT = "permanent"
@@ -92,15 +76,7 @@ class FailureType(str, Enum):
 
 
 class Color(str, Enum):
-    """ANSI color codes for terminal output.
-
-    Attributes:
-        RED: Error messages and failures
-        GREEN: Success messages
-        YELLOW: Warnings and in-progress items
-        BLUE: Information and headers
-        RESET: Reset to default terminal color
-    """
+    """ANSI color codes for terminal output."""
 
     RED = "\033[0;31m"
     GREEN = "\033[0;32m"
@@ -110,17 +86,7 @@ class Color(str, Enum):
 
 
 class ExecutionResult(TypedDict):
-    """Type-safe structure for execution results.
-
-    Attributes:
-        status: Current execution status
-        start_time: Unix timestamp when execution started (None if not started)
-        end_time: Unix timestamp when execution ended (None if not ended)
-        compile_time: Time taken for compilation in seconds
-        upload_time: Time taken for upload in seconds
-        retry_count: Number of retry attempts made
-        failure_type: Type of failure for retry decision (permanent/transient/unknown)
-    """
+    """Type-safe structure for execution results."""
 
     status: ExecutionStatus
     start_time: float | None
@@ -140,43 +106,6 @@ class ESPHomeRunnerError(Exception):
     pass
 
 
-class ProcessTerminationError(ESPHomeRunnerError):
-    """Raised when a process fails to terminate properly.
-
-    Attributes:
-        pid: Process ID that failed to terminate
-        file_path: File being processed when termination failed
-    """
-
-    def __init__(self, pid: int, file_path: str):
-        self.pid = pid
-        self.file_path = file_path
-        super().__init__(f"Failed to terminate process {pid} for {file_path}")
-
-
-class FileExecutionError(ESPHomeRunnerError):
-    """Raised when file execution fails.
-
-    Attributes:
-        file_path: Path to the file that failed
-        exit_code: Process exit code
-        original_error: Original exception if any
-    """
-
-    def __init__(
-        self,
-        file_path: str,
-        exit_code: int,
-        original_error: Exception | None = None,
-    ):
-        self.file_path = file_path
-        self.exit_code = exit_code
-        self.original_error = original_error
-        super().__init__(
-            f"Failed to execute {file_path} (exit code: {exit_code})"
-        )
-
-
 class ConfigurationError(ESPHomeRunnerError):
     """Raised when configuration is invalid.
 
@@ -192,26 +121,6 @@ class RunnerConfig:
 
     This class uses frozen=True to ensure immutability, preventing
     accidental modification of configuration after initialization.
-
-    Attributes:
-        files_to_run: List of YAML file paths to process
-        exclude_file: Path to file containing exclusion patterns
-        no_logs: Whether to disable log monitoring after upload
-        parallel_workers: Number of parallel workers (0 = serial mode)
-        compile_only: Whether to skip upload step
-        log_dir: Directory for log files
-        max_retries: Maximum number of retry attempts (configurable)
-        enable_failure_analysis: Enable smart failure analysis to skip retry on config errors
-
-    Constants:
-        RETRY_DELAY_SECONDS: Delay between retries
-        PROCESS_TERM_TIMEOUT: Timeout for graceful process termination
-        PROCESS_CLEANUP_TIMEOUT: Timeout for process cleanup
-        PROCESS_WAIT_TIMEOUT: Maximum time to wait for process completion
-        PROGRESS_UPDATE_INTERVAL: Update interval for progress display
-        PROGRESS_BAR_LENGTH: Character length of progress bar
-        MAX_FILENAME_DISPLAY: Maximum filename length in display
-        MAX_PARALLEL_WORKERS_WARNING: Threshold for worker count warning
     """
 
     files_to_run: list[str]
@@ -227,14 +136,19 @@ class RunnerConfig:
     warmup_enabled: bool = True
     warmup_cache_dir: Path = field(default_factory=lambda: _default_cache_dir())
     esphome_version: str = ""
+    # Fingerprint of the installed toolchains (PlatformIO penv state + the
+    # native ESP-IDF cache used by ESPHome >= 2026.7), sampled at startup.
+    # Compared against the warmup stamp so a toolchain change (cold cache)
+    # invalidates the stamp even when the ESPHome version is unchanged.
+    toolchain_fingerprint: str = ""
 
-    # Slow-start (independent of warmup): enforces minimum gap between task starts
-    # to mitigate pioarduino's install_esptool() --force-reinstall race on shared
-    # penv/ that runs at the beginning of every compile.
-    slow_start_interval: float = 5.0  # seconds; 0 disables
+    # Slow-start: enforces minimum gap between task starts to mitigate
+    # cold-cache toolchain install races (pioarduino install_esptool on shared
+    # penv/, native ESP-IDF framework extraction). The runner zeroes it at
+    # startup when the warmup stamp proves the caches are already warm.
+    slow_start_interval: float = 10.0  # seconds; 0 disables
 
     # Constants
-    RETRY_DELAY_SECONDS: float = 3.0  # Deprecated: use RETRY_BASE_DELAY
     RETRY_BASE_DELAY: float = 3.0  # Base delay for exponential backoff
     RETRY_MAX_DELAY: float = 60.0  # Maximum retry delay (cap for exponential backoff)
     RETRY_EXPONENTIAL_BASE: float = 2.0  # Exponential base (delay = base_delay * base^retry_count)
@@ -257,8 +171,7 @@ class RunnerConfig:
     def __post_init__(self) -> None:
         """Validate configuration after initialization.
 
-        Raises:
-            ConfigurationError: If configuration is invalid
+        Raises ConfigurationError if configuration is invalid.
         """
         if self.parallel_workers < 0:
             raise ConfigurationError("parallel_workers must be non-negative")
@@ -271,8 +184,7 @@ class RunnerConfig:
     def no_logs_arg(self) -> str:
         """Generate no-logs argument for ESPHome command.
 
-        Returns:
-            "--no-logs" if no_logs is True, empty string otherwise
+        Returns "--no-logs" if no_logs is True, empty string otherwise.
         """
         return "--no-logs" if self.no_logs else ""
 
@@ -287,20 +199,7 @@ class RunnerConfig:
 
         Formula: delay = min(RETRY_BASE_DELAY * (RETRY_EXPONENTIAL_BASE ^ retry_count), RETRY_MAX_DELAY)
 
-        Args:
-            retry_count: Current retry attempt number (0-indexed)
-
-        Returns:
-            Delay in seconds, capped at RETRY_MAX_DELAY
-
-        Examples:
-            >>> config = RunnerConfig(files_to_run=["test.yaml"])
-            >>> config.calculate_retry_delay(0)  # First retry
-            3.0
-            >>> config.calculate_retry_delay(1)  # Second retry
-            6.0
-            >>> config.calculate_retry_delay(2)  # Third retry
-            12.0
+        Returns Delay in seconds, capped at RETRY_MAX_DELAY.
         """
         if retry_count <= 0:
             return self.RETRY_BASE_DELAY
@@ -318,15 +217,6 @@ class ExecutionStats:
 
     This class provides efficient statistical calculations using Counter
     for aggregating execution results.
-
-    Attributes:
-        completed: Number of completed executions (success + failed + interrupted)
-        in_progress: Number of currently running executions
-        pending: Number of pending executions
-        failed: Number of failed executions
-        success: Number of successful executions
-        retrying: Number of executions currently retrying (in_progress with retry_count > 0)
-        total: Total number of executions
     """
 
     completed: int = 0
@@ -341,8 +231,7 @@ class ExecutionStats:
     def progress_pct(self) -> float:
         """Calculate progress percentage.
 
-        Returns:
-            Percentage of completed executions (0-100)
+        Returns Percentage of completed executions (0-100).
         """
         return (self.completed / self.total * 100) if self.total > 0 else 0.0
 
@@ -352,11 +241,7 @@ class ExecutionStats:
 
         Uses Counter for efficient aggregation of status counts.
 
-        Args:
-            results: Dictionary mapping file paths to execution results
-
-        Returns:
-            ExecutionStats instance with aggregated statistics
+        Returns ExecutionStats instance with aggregated statistics.
         """
         status_counts = Counter(r["status"] for r in results.values())
 
@@ -414,17 +299,7 @@ def create_execution_result(
     Factory function to ensure ExecutionResult instances are created
     with correct types, improving type safety.
 
-    Args:
-        status: Execution status
-        start_time: Start timestamp (None if not started)
-        end_time: End timestamp (None if not ended)
-        compile_time: Compilation time in seconds
-        upload_time: Upload time in seconds
-        retry_count: Number of retry attempts
-        failure_type: Type of failure (permanent/transient/unknown)
-
-    Returns:
-        Properly typed ExecutionResult instance
+    Returns Properly typed ExecutionResult instance.
     """
     return ExecutionResult(
         status=status,
@@ -438,12 +313,7 @@ def create_execution_result(
 
 
 def print_color(color: Color, message: str) -> None:
-    """Print a message in a given color.
-
-    Args:
-        color: ANSI color to use
-        message: Message to print
-    """
+    """Print a message in a given color."""
     print(f"{color.value}{message}{Color.RESET.value}")
 
 
@@ -494,21 +364,174 @@ def get_esphome_version() -> str:
     return output or "unknown"
 
 
+def get_toolchain_fingerprint() -> str:
+    """Fingerprint the installed toolchain state (cheap, no subprocess).
+
+    Two independent toolchain ecosystems can race during parallel batch
+    builds; the fingerprint covers both so a change in either invalidates the
+    warmup stamp even when the ESPHome version -- and therefore the stamp
+    filename -- is unchanged (the gap the version-only key missed and that
+    slow-start could not deterministically cover):
+
+    - PlatformIO (~/.platformio): pioarduino re-runs `install_esptool()
+      --force-reinstall` into the shared penv at the start of every compile
+      while the penv esptool differs from the version pinned by the active
+      platform package. Still exercised by esp8266 / LibreTiny builds and by
+      esp32 with `toolchain: platformio` (ESPHome >= 2026.7 builds esp32
+      natively by default).
+    - Native ESP-IDF cache (ESPHome >= 2026.7): the installer has no
+      inter-process locking -- two cold parallel builds both rmdir and
+      re-extract the same frameworks/<version> tree, corrupting it.
+
+    All components degrade to "unknown"/"absent" on read errors, which reads
+    as cold and forces a fresh serial warmup first.
+    """
+    return f"{_platformio_fingerprint()}|{_espidf_fingerprint()}"
+
+
+def _platformio_fingerprint() -> str:
+    """PlatformIO toolchain state under ~/.platformio.
+
+    Components:
+      - active espressif platform package versions   -> general toolchain bumps
+      - tool-esptoolpy package version ("required")  -> what the platform wants
+      - esptool version installed in the penv ("have") -> what is actually there
+
+    When required != have, a force-reinstall is pending and parallel builds
+    will race; the differing fingerprint forces a fresh serial warmup first.
+    """
+    pio = Path.home() / ".platformio"
+
+    plats: list[str] = []
+    plat_dir = pio / "platforms"
+    if plat_dir.is_dir():
+        for pj in sorted(plat_dir.glob("*/platform.json")):
+            try:
+                data = json.loads(pj.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            plats.append(f"{data.get('name', '?')}@{data.get('version', '?')}")
+    platforms = ",".join(sorted(set(plats))) if plats else "unknown"
+
+    pkg_ver = "unknown"
+    pkg_json = pio / "packages" / "tool-esptoolpy" / "package.json"
+    try:
+        pkg_ver = json.loads(pkg_json.read_text(encoding="utf-8")).get(
+            "version", "unknown"
+        )
+    except (OSError, ValueError):
+        pass
+
+    penv_ver = "unknown"
+    penv_lib = pio / "penv" / "lib"
+    if penv_lib.is_dir():
+        dists = sorted(penv_lib.glob("python*/site-packages/esptool-*.dist-info"))
+        if dists:
+            name = dists[0].name  # e.g. "esptool-5.2.0.dist-info"
+            penv_ver = name[len("esptool-"):-len(".dist-info")]
+
+    return f"platforms={platforms}|esptool_pkg={pkg_ver}|esptool_penv={penv_ver}"
+
+
+def _espidf_cache_root() -> Path:
+    """Root of ESPHome's native ESP-IDF toolchain cache (>= 2026.7).
+
+    Mirrors esphome's own resolution -- ESPHOME_ESP_IDF_PREFIX override, else
+    platformdirs.user_cache_dir("esphome", appauthor=False) / "idf" -- without
+    taking on the platformdirs dependency.
+    """
+    if prefix := os.environ.get("ESPHOME_ESP_IDF_PREFIX", "").strip():
+        return Path(prefix).expanduser()
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Caches" / "esphome" / "idf"
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA")
+        base_path = Path(base) if base else Path.home() / "AppData" / "Local"
+        return base_path / "esphome" / "Cache" / "idf"
+    xdg = os.environ.get("XDG_CACHE_HOME")
+    base_path = Path(xdg) if xdg else Path.home() / ".cache"
+    return base_path / "esphome" / "idf"
+
+
+def _espidf_fingerprint() -> str:
+    """Native ESP-IDF cache state (frameworks + python envs).
+
+    Captured per frameworks/<ver>: the extraction-complete marker and
+    ESPHome's install stamp, which records the installed targets/tools sets.
+    A single build installs toolchains for all chip targets (targets=["all"]),
+    so one warm representative covers every esp32 variant. penvs/<ver> tracks
+    the per-IDF-version python envs.
+    """
+    root = _espidf_cache_root()
+
+    frameworks: list[str] = []
+    fw_dir = root / "frameworks"
+    if fw_dir.is_dir():
+        for d in sorted(fw_dir.iterdir()):
+            if not d.is_dir():
+                continue
+            state = (
+                "extracted" if (d / ".esphome_extracted").is_file() else "partial"
+            )
+            stamp = "no-stamp"
+            try:
+                data = json.loads(
+                    (d / ".esphome.stamp.json").read_text(encoding="utf-8")
+                )
+                targets = ",".join(data.get("targets", []))
+                tools = ",".join(data.get("tools", []))
+                stamp = f"targets={targets};tools={tools}"
+            except (OSError, ValueError):
+                pass
+            frameworks.append(f"{d.name}:{state}:{stamp}")
+
+    penvs: list[str] = []
+    penv_dir = root / "penvs"
+    if penv_dir.is_dir():
+        penvs = sorted(p.name for p in penv_dir.iterdir() if p.is_dir())
+
+    fw_part = ",".join(frameworks) if frameworks else "absent"
+    penv_part = ",".join(penvs) if penvs else "absent"
+    return f"idf_frameworks={fw_part}|idf_penvs={penv_part}"
+
+
 class BucketKey(NamedTuple):
     """Toolchain bucket identity for grouping yamls during warmup.
 
-    Two yamls with the same BucketKey exercise the same PlatformIO
-    toolchain + framework installation path, so compiling one of them
-    warms the cache for all.
+    Two yamls with the same BucketKey exercise the same toolchain +
+    framework installation path (PlatformIO packages or the native ESP-IDF
+    cache), so compiling one of them warms the cache for all.
     """
-    platform: str          # "esp32" / "esp8266" / "rp2040" / "default"
+    platform: str          # "esp32" / "esp8266" / "rp2" / "ln882x" / ... / "default"
     chip_variant: str      # "ESP32" / "ESP32S3" / "ESP32C3" / ... or platform fallback
     framework_type: str    # "esp-idf" / "arduino" / "default"
     framework_version: str # "recommended" / "latest" / URL / "default"
+    # ESPHome >= 2026.7 esp32 `toolchain:` key ("platformio" opts out of the
+    # native ESP-IDF toolchain). Different toolchains install into different
+    # caches, so they must warm separately. Defaulted so 4-field construction
+    # sites (and sentinels) keep working.
+    toolchain: str = "default"
 
 
-_KNOWN_PLATFORMS = ("esp32", "esp8266", "rp2040", "bk72xx", "rtl87xx",
-                    "libretiny", "host")
+_KNOWN_PLATFORMS = ("esp32", "esp8266", "rp2040", "rp2", "bk72xx", "rtl87xx",
+                    "libretiny", "ln882x", "nrf52", "host")
+
+# Sentinel buckets. PROBE_FAILED groups yamls whose `esphome config` failed —
+# warmup skips them since they will fail again and surface the real error in
+# the parallel phase. NO_PLATFORM groups yamls with no recognized platform
+# key (rare); they still get warmed as their own bucket.
+PROBE_FAILED_BUCKET = BucketKey("<probe-failed>", "", "", "")
+NO_PLATFORM_BUCKET = BucketKey("<no-platform>", "", "", "")
+
+
+def format_bucket_label(bk: BucketKey) -> str:
+    """Render a BucketKey for display. Sentinels show only their tag."""
+    if bk in (PROBE_FAILED_BUCKET, NO_PLATFORM_BUCKET):
+        return bk.platform
+    parts = list(bk)
+    if bk.toolchain == "default":
+        parts.pop()  # keep labels stable for the common no-override case
+    return "/".join(parts)
 
 
 def _find_field(lines: list[str], path: tuple[str, ...]) -> str | None:
@@ -560,7 +583,7 @@ def extract_bucket_fields(resolved_config: str) -> BucketKey:
         if platform != "default":
             break
     if platform == "default":
-        return BucketKey("default", "default", "default", "default")
+        return NO_PLATFORM_BUCKET
 
     variant = _find_field(lines, (platform, "variant")) or platform
     framework_type = _find_field(lines, (platform, "framework", "type"))
@@ -575,7 +598,8 @@ def extract_bucket_fields(resolved_config: str) -> BucketKey:
         # rp2040 uses framework.platform_version instead of .version
         framework_version = _find_field(lines, (platform, "framework", "platform_version")) or "default"
 
-    return BucketKey(platform, variant, framework_type, framework_version)
+    toolchain = _find_field(lines, (platform, "toolchain")) or "default"
+    return BucketKey(platform, variant, framework_type, framework_version, toolchain)
 
 
 def probe_bucket(file_path: str, timeout: float = 60.0) -> BucketKey:
@@ -594,25 +618,43 @@ def probe_bucket(file_path: str, timeout: float = 60.0) -> BucketKey:
             timeout=timeout,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired):
-        return BucketKey("default", "default", "default", "default")
+        return PROBE_FAILED_BUCKET
     if result.returncode != 0:
-        return BucketKey("default", "default", "default", "default")
+        return PROBE_FAILED_BUCKET
     return extract_bucket_fields(result.stdout)
 
 
-def read_warmup_stamp(stamp_path: Path) -> bool:
-    """Return True if the warmup stamp exists at `stamp_path`.
+def read_warmup_stamp(stamp_path: Path, expected_fingerprint: str) -> bool:
+    """Return True only if a valid, toolchain-matching warmup stamp exists.
 
-    Content is intentionally not validated — presence is the signal.
+    A stamp is honored (warmup skipped) only when its recorded
+    `toolchain_fingerprint` matches the current one. A missing file, an
+    unparseable stamp, a legacy stamp without the fingerprint field, or a
+    fingerprint mismatch all read as "cold" -> return False so a fresh serial
+    warmup runs before parallel dispatch. This is what stops a toolchain upgrade
+    (e.g. an esptool pinned-version bump, or a wiped native ESP-IDF cache)
+    from racing when the ESPHome version -- and therefore the stamp filename --
+    has not changed.
     """
-    return stamp_path.is_file()
+    try:
+        data = json.loads(stamp_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return data.get("toolchain_fingerprint") == expected_fingerprint
 
 
 def write_warmup_stamp(stamp_path: Path, version: str, buckets: list[str]) -> bool:
-    """Write a diagnostic stamp file. Returns True on success, False on IO error."""
+    """Write the warmup stamp. Returns True on success, False on IO error.
+
+    The toolchain fingerprint is sampled here, AFTER the serial warmup build
+    has installed and aligned the toolchains (PlatformIO penv esptool, native
+    ESP-IDF framework + tools), so a freshly written stamp records the "warm"
+    (consistent) fingerprint.
+    """
     payload = {
         "version": version,
         "timestamp": datetime.now(timezone.utc).isoformat(),
+        "toolchain_fingerprint": get_toolchain_fingerprint(),
         "buckets": buckets,
     }
     try:
@@ -626,11 +668,7 @@ def write_warmup_stamp(stamp_path: Path, version: str, buckets: list[str]) -> bo
 def strip_ansi(text: str) -> str:
     """Remove ANSI escape codes from a string.
 
-    Args:
-        text: String potentially containing ANSI codes
-
-    Returns:
-        String with ANSI codes removed
+    Returns String with ANSI codes removed.
     """
     return RegexPatterns.ANSI_ESCAPE.sub("", text)
 
@@ -640,10 +678,6 @@ def append_failure_analysis_note(log_path: Path, failure_type: FailureType) -> N
 
     Writes a detailed explanation to the log file when a permanent failure
     is detected, helping users understand why retry was skipped.
-
-    Args:
-        log_path: Path to log file to append note
-        failure_type: Type of failure detected
     """
     if failure_type != FailureType.PERMANENT:
         return
@@ -675,26 +709,9 @@ def append_failure_analysis_note(log_path: Path, failure_type: FailureType) -> N
 def calculate_common_prefix(file_paths: list[str]) -> tuple[str, int]:
     """Calculate the common directory prefix for a list of file paths.
 
-    Args:
-        file_paths: List of file paths to analyze
-
-    Returns:
-        Tuple of (common_prefix_path, depth) where:
-        - common_prefix_path: The common directory prefix (empty if none)
-        - depth: Number of directory levels in the common prefix
-
-    Examples:
-        >>> calculate_common_prefix([
-        ...     "examples/Brand/CategoryA/file1.yaml",
-        ...     "examples/Brand/CategoryB/file2.yaml"
-        ... ])
-        ("examples/Brand", 2)
-
-        >>> calculate_common_prefix(["file1.yaml", "file2.yaml"])
-        ("", 0)
-
-        >>> calculate_common_prefix(["examples/Brand/file.yaml"])
-        ("examples/Brand", 2)
+    Returns (common_prefix_path, depth): the common directory prefix (empty
+    if none) and the number of directory levels it contains, e.g.
+    ["examples/Brand/A/x.yaml", "examples/Brand/B/y.yaml"] -> ("examples/Brand", 2).
     """
     if not file_paths:
         return "", 0
@@ -731,61 +748,38 @@ def calculate_common_prefix(file_paths: list[str]) -> tuple[str, int]:
 # =============================================================================
 
 
-class FailureAnalyzer(Protocol):
-    """Protocol for failure analysis strategies.
-
-    This protocol defines the interface for analyzing execution failures
-    to determine if they are permanent (configuration errors) or transient
-    (network/resource issues). Follows Interface Segregation Principle.
-    """
-
-    def analyze(self, log_path: Path) -> FailureType:
-        """Analyze log file to determine failure type.
-
-        Args:
-            log_path: Path to execution log file
-
-        Returns:
-            FailureType indicating if error is permanent, transient, or unknown
-        """
-        ...
-
-
 class ESPHomeFailureAnalyzer:
     """Analyzes ESPHome execution logs to identify permanent failures.
 
     This implementation detects common configuration errors that won't be
     fixed by retry, such as YAML syntax errors or missing files. Follows
     Single Responsibility and Open/Closed principles.
-
-    Attributes:
-        PERMANENT_ERROR_PATTERNS: List of regex patterns for permanent errors
     """
 
     # Patterns for permanent errors (Open for extension)
     PERMANENT_ERROR_PATTERNS: list[str] = [
         r"Invalid YAML syntax",
         r"Failed config",
+        # Native ESP-IDF builds (ESPHome >= 2026.7): a CMake configure
+        # failure is deterministic -- retrying just repeats a long build.
+        r"CMake Error",
     ]
 
     def analyze(self, log_path: Path) -> FailureType:
         """Analyze ESPHome log file for permanent errors.
 
-        Reads the first 100 lines of the log file (configuration errors
-        typically appear early) and checks for known permanent error patterns.
+        Reads the first 300 lines of the log file (configuration errors appear
+        within the first few lines; CMake configure errors follow the esphome
+        preamble but still precede the bulk of compile output) and checks for
+        known permanent error patterns.
 
-        Args:
-            log_path: Path to log file to analyze
-
-        Returns:
-            FailureType.PERMANENT if configuration error detected,
-            FailureType.UNKNOWN otherwise (conservative retry)
+        Returns FailureType.PERMANENT if configuration error detected, FailureType.UNKNOWN otherwise (conservative retry).
         """
         try:
             with open(log_path, "r", encoding="utf-8", errors="replace") as log_file:
-                # Read first 100 lines (config errors appear early)
+                # Read first 300 lines (config + CMake errors appear early)
                 lines = []
-                for _ in range(100):
+                for _ in range(300):
                     line = log_file.readline()
                     if not line:
                         break
@@ -817,13 +811,6 @@ class FileFilter:
 
     This class is responsible for reading exclusion patterns from a file
     and filtering a list of files based on those patterns.
-
-    Attributes:
-        exclude_file: Path to the exclusion file
-        patterns: List of active exclusion patterns
-
-    Constants:
-        DEFAULT_PATTERNS: Default exclusion patterns used when no exclude file exists
     """
 
     # Default exclusion patterns (used when no exclude file)
@@ -835,11 +822,7 @@ class FileFilter:
     ]
 
     def __init__(self, exclude_file: Path):
-        """Initialize the file filter.
-
-        Args:
-            exclude_file: Path to file containing exclusion patterns
-        """
+        """Initialize the file filter."""
         self.exclude_file = exclude_file
         self.patterns: list[str] = []
 
@@ -874,11 +857,7 @@ class FileFilter:
     def filter_files(self, files: list[str]) -> tuple[list[str], list[str]]:
         """Filter files based on loaded exclusion patterns.
 
-        Args:
-            files: List of file paths to filter
-
-        Returns:
-            Tuple of (included_files, excluded_files)
+        Returns Tuple of (included_files, excluded_files).
         """
         if not self.patterns:
             return files, []
@@ -908,12 +887,7 @@ class FileFilter:
 
         Convenience method that combines load_patterns() and filter_files().
 
-        Args:
-            files: List of file paths to filter
-            verbose: Whether to print summary information
-
-        Returns:
-            List of included files after filtering
+        Returns List of included files after filtering.
         """
         self.load_patterns()
         included_files, excluded_files = self.filter_files(files)
@@ -938,12 +912,6 @@ class ResultTracker:
     thread-safe operations for parallel mode. It is responsible only for
     data storage and retrieval, following the Single Responsibility Principle.
     Presentation logic is handled by ResultSummaryRenderer.
-
-    Attributes:
-        results: Dictionary mapping file paths to execution results
-        results_lock: Thread lock for safe concurrent access
-        overall_start_time: Wall clock start time for parallel mode
-        overall_end_time: Wall clock end time for parallel mode
     """
 
     def __init__(self) -> None:
@@ -960,9 +928,6 @@ class ResultTracker:
         the warmup phase). Other existing statuses are reset to PENDING
         because this is called before each execution batch and stale
         FAILED/IN_PROGRESS entries should not leak forward.
-
-        Args:
-            files: List of file paths to initialize
         """
         with self.results_lock:
             for file_path in files:
@@ -974,23 +939,14 @@ class ResultTracker:
                 )
 
     def update_result(self, file_path: str, result: ExecutionResult) -> None:
-        """Update result for a file (thread-safe).
-
-        Args:
-            file_path: Path to file
-            result: New execution result
-        """
+        """Update result for a file (thread-safe)."""
         with self.results_lock:
             self.results[file_path] = result
 
     def get_result(self, file_path: str) -> ExecutionResult | None:
         """Get result for a file (thread-safe).
 
-        Args:
-            file_path: Path to file
-
-        Returns:
-            ExecutionResult if exists, None otherwise
+        Returns ExecutionResult if exists, None otherwise.
         """
         with self.results_lock:
             return self.results.get(file_path)
@@ -998,8 +954,7 @@ class ResultTracker:
     def get_stats(self) -> ExecutionStats:
         """Get current execution statistics (thread-safe).
 
-        Returns:
-            ExecutionStats with current counts
+        Returns ExecutionStats with current counts.
         """
         with self.results_lock:
             return ExecutionStats.from_results(self.results)
@@ -1007,25 +962,12 @@ class ResultTracker:
     def get_all_results(self) -> dict[str, ExecutionResult]:
         """Get deep copy of all results (thread-safe).
 
-        Returns:
-            Deep copy of results dictionary. Modifying the returned
-            dictionary will not affect the internal state.
+        Returns Deep copy of results dictionary. Modifying the returned dictionary will not affect the internal state.
         """
         import copy
 
         with self.results_lock:
             return copy.deepcopy(self.results)
-
-
-@dataclass
-class WarmupResult:
-    """Outcome of serially compiling warmup representatives."""
-    attempted: list[str] = field(default_factory=list)
-    failures: list[str] = field(default_factory=list)
-
-    @property
-    def success(self) -> bool:
-        return not self.failures
 
 
 @dataclass
@@ -1043,12 +985,37 @@ class WarmupPhase:
 
     Groups the filtered file list by BucketKey, picks one file per
     bucket, and compiles the representatives sequentially via
-    `esphome compile` so that PlatformIO's package cache is populated
-    before any parallel worker starts.
+    `esphome compile` so that the toolchain caches (PlatformIO packages /
+    the native ESP-IDF install) are populated before any parallel worker
+    starts.
     """
 
     def __init__(self, config: "RunnerConfig"):
         self.config = config
+        # Streaming state — populated by begin(), consumed by workers via
+        # wait_for_file() and by the background compile thread. Always
+        # re-initialized at the top of begin() so the same WarmupPhase
+        # instance can be reused safely across invocations.
+        self._gate_enabled: bool = False
+        self._bucket_ready: dict[BucketKey, threading.Event] = {}
+        self._file_to_bucket: dict[str, BucketKey] = {}
+        self._compile_thread: threading.Thread | None = None
+        self._outcome: WarmupOutcome = WarmupOutcome()
+        self._result_tracker_ref: "ResultTracker | None" = None
+        # Cancellation signal — set by cancel() (called from the executor's
+        # interrupt handler). The compile loop checks it between reps and
+        # while polling each subprocess; wait_for_file checks it before
+        # blocking and after waking so workers don't hang on Ctrl-C.
+        self._cancelled: threading.Event = threading.Event()
+    # Maximum wall time we'll wait for one warmup `esphome compile`. A cold
+    # native ESP-IDF warmup (ESPHome >= 2026.7) downloads the framework,
+    # per-target compilers and a python env before the first full build, so
+    # this needs generous headroom. If a subprocess hangs (e.g. a flaky
+    # mirror), we'd rather fail it and let the parallel phase surface the
+    # real error than block forever.
+    WARMUP_REP_TIMEOUT_SECONDS: float = 1800.0
+    # Poll interval for cancellation while a rep subprocess is running.
+    WARMUP_POLL_INTERVAL_SECONDS: float = 0.5
 
     def probe_buckets(self, files: list[str]) -> dict["BucketKey", list[str]]:
         """Run `esphome config` on each file (parallel), group by BucketKey.
@@ -1111,128 +1078,325 @@ class WarmupPhase:
                 reps.append(sorted(files_in_bucket)[0])
         return reps
 
-    def run_serial(self, reps: list[str]) -> WarmupResult:
-        """Compile each representative sequentially with `esphome compile`.
+    def begin(
+        self,
+        files: list[str],
+        result_tracker: "ResultTracker | None" = None,
+    ) -> "WarmupOutcome | None":
+        """Set up warmup state and kick off background compilation.
 
-        Subprocess output is redirected to per-rep log files under
-        `config.log_dir`; the terminal shows one line per rep that
-        transitions from `compiling...` to `✓ 45.2s` / `✗ 32.1s` in place.
+        Returns None if streaming compilation was started in a background
+        thread — the caller MUST then gate workers via wait_for_file() and
+        eventually call finish() to retrieve the outcome.
+
+        Returns a terminal WarmupOutcome when warmup is not applicable
+        (disabled, cache hit, or single-worker mode) — the caller can use
+        it directly and skip gating.
+
+        Passing a result_tracker enables marking each rep as SUCCESS as
+        soon as its compile finishes, so a worker assigned the rep file
+        will skip it instead of recompiling.
         """
-        result = WarmupResult()
+        # Re-initialize state so calling begin() twice on the same instance
+        # is safe (tests, future retry loops). Anything left over from a
+        # prior invocation would otherwise leak: stale outcome flags, fired
+        # bucket Events that workers wait_for_file would no-op past, etc.
+        self._outcome = WarmupOutcome()
+        self._gate_enabled = False
+        self._bucket_ready = {}
+        self._file_to_bucket = {}
+        self._compile_thread = None
+        self._result_tracker_ref = None
+        self._cancelled = threading.Event()
+
+        if not self.config.warmup_enabled:
+            self._outcome.disabled = True
+            return self._outcome
+        # Check the stamp BEFORE the single-worker shortcut so a prior
+        # successful warmup is honored regardless of the current execution
+        # mode (otherwise `-j 1` would always claim disabled even when a
+        # valid cache stamp from `-j 4` exists).
+        if read_warmup_stamp(
+            self.config.warmup_cache_path, self.config.toolchain_fingerprint
+        ):
+            self._outcome.cache_hit = True
+            return self._outcome
+        if self.config.parallel_workers <= 1:
+            self._outcome.disabled = True
+            return self._outcome
+
+        print_color(Color.BLUE, "Warmup phase:")
+        buckets = self.probe_buckets(files)
+        probe_failed_files = buckets.pop(PROBE_FAILED_BUCKET, [])
+        if probe_failed_files:
+            print_color(
+                Color.YELLOW,
+                f"  {len(probe_failed_files)} yaml(s) failed probe "
+                "(parallel phase will surface the error):"
+            )
+            for f in probe_failed_files:
+                print_color(Color.YELLOW, f"    - {f}")
+        reps = self.select_representatives(buckets)
+        self._outcome.buckets = [
+            format_bucket_label(bk) for bk in sorted(buckets.keys())
+        ]
+        if not reps:
+            self._outcome.success = True
+            return self._outcome
+
+        rep_by_bucket = {sorted(bf)[0]: bk for bk, bf in buckets.items() if bf}
+        sorted_keys = sorted(buckets.keys())
+        width = max(
+            (len(format_bucket_label(bk)) for bk in sorted_keys), default=0
+        )
+        print_color(Color.BLUE, f"  {len(reps)} toolchain bucket(s) detected:")
+        for bk in sorted_keys:
+            label = format_bucket_label(bk).ljust(width)
+            print_color(Color.BLUE, f"    {label}  →  {sorted(buckets[bk])[0]}")
+        print_color(
+            Color.BLUE,
+            "  Compiling representatives in background; workers join as each "
+            "bucket warms up (PIO output redirected to logs/*-warmup.log)."
+        )
+
+        # Set up gating: per-bucket Event + file→bucket lookup.
+        self._gate_enabled = True
+        for bk, bf in buckets.items():
+            self._bucket_ready[bk] = threading.Event()
+            for f in bf:
+                self._file_to_bucket[f] = bk
+
+        self._result_tracker_ref = result_tracker
+        # Set ESPHOME_SKIP_CLEAN_BUILD BEFORE starting workers (which may
+        # spawn esphome subprocesses as soon as their bucket Event fires).
+        # If we waited until _compile_loop's tail to flip this, early-bucket
+        # workers would inherit an unset env and do a redundant clean.
+        os.environ["ESPHOME_SKIP_CLEAN_BUILD"] = "1"
+        self._compile_thread = threading.Thread(
+            target=self._compile_loop,
+            args=(reps, rep_by_bucket),
+            daemon=True,
+            name="WarmupCompile",
+        )
+        self._compile_thread.start()
+        return None  # Streaming in progress; caller must call finish()
+
+    def _compile_loop(
+        self,
+        reps: list[str],
+        rep_to_bucket: dict[str, "BucketKey"],
+    ) -> None:
+        """Sequential rep compilation, firing bucket events as each finishes.
+
+        Invariant: by the time this function returns (for ANY reason — clean
+        completion, cancellation, unexpected exception), every Event in
+        self._bucket_ready is .set(). Workers blocked in wait_for_file()
+        MUST observe a set Event to make progress; if even one Event is
+        left unset the workers waiting on that bucket hang forever.
+        """
         log_dir = self.config.log_dir
         try:
             log_dir.mkdir(parents=True, exist_ok=True)
         except OSError:
-            pass  # write will fail gracefully below if dir is unreachable
+            pass
 
+        failures: list[str] = []
         total = len(reps)
-        is_tty = sys.stdout.isatty()
-
-        for idx, rep in enumerate(reps, 1):
-            result.attempted.append(rep)
-            cmd = ["esphome", "compile", rep]
-            log_path = log_dir / f"{Path(rep).stem}-warmup.log"
-            prefix = f"    [{idx}/{total}] {rep}"
-
-            # In-progress indicator
-            if is_tty:
-                sys.stdout.write(f"{prefix}  compiling...")
-                sys.stdout.flush()
-            else:
-                print(f"{prefix}  compiling...  (log: {log_path})")
-
-            start = time.monotonic()
-            try:
-                with open(log_path, "w", encoding="utf-8") as log_file:
-                    proc = subprocess.run(
-                        cmd,
-                        stdout=log_file,
-                        stderr=subprocess.STDOUT,
-                    )
-            except (FileNotFoundError, KeyboardInterrupt, OSError):
-                result.failures.append(rep)
-                if is_tty:
-                    sys.stdout.write(f"\r{prefix}  ✗ interrupted\x1b[K\n")
-                    sys.stdout.flush()
+        cancelled_midway = False
+        try:
+            for idx, rep in enumerate(reps, 1):
+                if self._cancelled.is_set():
+                    cancelled_midway = True
+                    break
+                success = self._compile_one_rep(rep, idx, total, log_dir)
+                if success is None:
+                    # Cancellation surfaced from inside the subprocess poll —
+                    # treat the remaining reps as un-attempted.
+                    cancelled_midway = True
+                    break
+                if success:
+                    self._outcome.reps_compiled.append(rep)
+                    if self._result_tracker_ref is not None:
+                        self._result_tracker_ref.update_result(
+                            rep,
+                            create_execution_result(
+                                status=ExecutionStatus.SUCCESS,
+                                retry_count=0,
+                            ),
+                        )
                 else:
-                    print(f"{prefix}  ✗ interrupted")
-                break
-            elapsed = time.monotonic() - start
+                    failures.append(rep)
+                bucket = rep_to_bucket.get(rep)
+                if bucket is not None:
+                    self._bucket_ready[bucket].set()
+        finally:
+            # Always release every remaining Event, even on uncaught
+            # exception or cancellation. Workers blocked on wait_for_file
+            # depend on this to make progress.
+            for ev in self._bucket_ready.values():
+                ev.set()
+            # Compute the real success state. Default-True from the
+            # dataclass would lie about a partial / cancelled run.
+            attempted = len(self._outcome.reps_compiled) + len(failures)
+            self._outcome.success = (
+                not failures
+                and not cancelled_midway
+                and attempted == total
+            )
 
-            if proc.returncode != 0:
-                result.failures.append(rep)
-                final = f"{prefix}  ✗ {elapsed:.1f}s  (see {log_path})"
-            else:
-                final = f"{prefix}  ✓ {elapsed:.1f}s"
-
-            if is_tty:
-                # \x1b[K = erase to end of line (clears any "compiling..." tail)
-                sys.stdout.write(f"\r{final}\x1b[K\n")
-                sys.stdout.flush()
-            else:
-                print(final)
-        return result
-
-    def run(self, files: list[str]) -> WarmupOutcome:
-        """Full warmup flow. Respects stamp, --disable-warmup, and failures."""
-        outcome = WarmupOutcome()
-        if not self.config.warmup_enabled:
-            outcome.disabled = True
-            return outcome
-
-        stamp = self.config.warmup_cache_path
-        if read_warmup_stamp(stamp):
-            outcome.cache_hit = True
-            return outcome
-
-        print_color(Color.BLUE, "Warmup phase:")
-        buckets = self.probe_buckets(files)
-        reps = self.select_representatives(buckets)
-        outcome.buckets = ["/".join(bk) for bk in sorted(buckets.keys())]
-        if not reps:
-            outcome.success = True
-            return outcome
-
-        # Build rep → bucket map for display (select_representatives picks the
-        # alphabetically-first file per bucket, so we recompute the same mapping).
-        rep_by_bucket = {bk: sorted(bucket_files)[0]
-                         for bk, bucket_files in buckets.items() if bucket_files}
-        sorted_keys = sorted(rep_by_bucket.keys())
-        bucket_label_width = max(
-            (len("/".join(bk)) for bk in sorted_keys), default=0
-        )
-        print_color(Color.BLUE, f"  {len(reps)} toolchain bucket(s) detected:")
-        for bk in sorted_keys:
-            label = "/".join(bk).ljust(bucket_label_width)
-            print_color(Color.BLUE, f"    {label}  →  {rep_by_bucket[bk]}")
-        print_color(
-            Color.BLUE,
-            "  Compiling representatives serially "
-            "(PIO output redirected to logs/*-warmup.log):"
-        )
-        serial_result = self.run_serial(reps)
-        outcome.reps_compiled = [r for r in serial_result.attempted
-                                 if r not in serial_result.failures]
-        outcome.success = serial_result.success
-
-        if outcome.success:
+        # Post-completion bookkeeping. Only persist the stamp / nudge the
+        # env on a clean full success — partial warmup must NOT be cached.
+        if self._outcome.success:
             written = write_warmup_stamp(
-                stamp,
+                self.config.warmup_cache_path,
                 version=self.config.esphome_version or "unknown",
-                buckets=outcome.buckets,
+                buckets=self._outcome.buckets,
             )
             if not written:
                 print_color(
                     Color.YELLOW,
-                    f"Warning: could not write warmup stamp at {stamp}"
+                    f"Warning: could not write warmup stamp at "
+                    f"{self.config.warmup_cache_path}"
                 )
-        else:
+        elif failures:
             print_color(
                 Color.YELLOW,
-                f"Warmup: {len(serial_result.failures)} rep(s) failed; "
+                f"Warmup: {len(failures)} rep(s) failed; "
                 "parallel phase will surface their errors"
             )
-        return outcome
+        elif cancelled_midway:
+            print_color(Color.YELLOW, "Warmup: cancelled before completion")
+
+    def _compile_one_rep(
+        self,
+        rep: str,
+        idx: int,
+        total: int,
+        log_dir: Path,
+    ) -> bool | None:
+        """Compile a single warmup rep with cancellation polling.
+
+        Returns True on success, False on failure, None if cancelled mid-flight.
+        """
+        cmd = ["esphome", "compile", rep]
+        log_path = log_dir / f"{Path(rep).stem}-warmup.log"
+        start = time.monotonic()
+        proc: subprocess.Popen | None = None
+        try:
+            log_file = open(log_path, "w", encoding="utf-8")
+        except OSError:
+            print_color(
+                Color.YELLOW,
+                f"  [warmup {idx}/{total}] {rep}  ✗ could not open log"
+            )
+            return False
+        try:
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                )
+            except (FileNotFoundError, OSError) as e:
+                print_color(
+                    Color.YELLOW,
+                    f"  [warmup {idx}/{total}] {rep}  ✗ spawn failed: {e}"
+                )
+                return False
+            # Poll loop so cancellation actually preempts a long compile.
+            deadline = start + self.WARMUP_REP_TIMEOUT_SECONDS
+            while True:
+                if self._cancelled.is_set():
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait()
+                    return None
+                try:
+                    rc = proc.wait(timeout=self.WARMUP_POLL_INTERVAL_SECONDS)
+                    break
+                except subprocess.TimeoutExpired:
+                    if time.monotonic() > deadline:
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            proc.kill()
+                            proc.wait()
+                        elapsed = time.monotonic() - start
+                        print_color(
+                            Color.YELLOW,
+                            f"  [warmup {idx}/{total}] {rep}  "
+                            f"✗ {elapsed:.1f}s  (timed out — see {log_path})"
+                        )
+                        return False
+            success = rc == 0
+        finally:
+            try:
+                log_file.close()
+            except OSError:
+                pass
+        elapsed = time.monotonic() - start
+        if success:
+            status_str = f"✓ {elapsed:.1f}s"
+        else:
+            status_str = f"✗ {elapsed:.1f}s  (see {log_path})"
+        # Single completion line — the parallel progress display is
+        # concurrently writing to the same terminal during streaming warmup,
+        # so no in-place cursor updates here.
+        print_color(
+            Color.BLUE,
+            f"  [warmup {idx}/{total}] {rep}  {status_str}"
+        )
+        return success
+
+    def cancel(self) -> None:
+        """Signal the background compile loop to stop and unblock all workers.
+
+        Called by the executor's interrupt handler. Safe to call multiple
+        times and safe to call when no streaming is in progress.
+        """
+        self._cancelled.set()
+        # Release every bucket Event so wait_for_file() returns immediately.
+        for ev in self._bucket_ready.values():
+            ev.set()
+
+    def wait_for_file(self, file_path: str) -> None:
+        """Worker hook: block until this file's toolchain bucket is warmed.
+
+        No-op when streaming gating is disabled (warmup disabled, serial
+        mode, cache hit, or the file isn't in any tracked bucket). Also
+        returns immediately once cancel() has been called, so an interrupted
+        run never leaves workers blocked indefinitely.
+        """
+        if not self._gate_enabled or self._cancelled.is_set():
+            return
+        bucket = self._file_to_bucket.get(file_path)
+        if bucket is None:
+            return
+        event = self._bucket_ready.get(bucket)
+        if event is not None:
+            event.wait()
+
+    def finish(self) -> WarmupOutcome:
+        """Block until background warmup completes; return the final outcome."""
+        if self._compile_thread is not None:
+            self._compile_thread.join()
+        return self._outcome
+
+    def run(self, files: list[str]) -> WarmupOutcome:
+        """Synchronous shim: kick off streaming and wait for completion.
+
+        Kept for callers that don't want to gate workers on warmup progress
+        (the gating is harmless either way; without it, this just runs
+        warmup to completion before returning).
+        """
+        early = self.begin(files, result_tracker=None)
+        if early is not None:
+            return early
+        return self.finish()
 
 
 class ResultSummaryRenderer:
@@ -1247,17 +1411,10 @@ class ResultSummaryRenderer:
     - Color-coded status display
     - Time formatting and highlighting
     - Summary statistics calculation
-
-    Attributes:
-        result_tracker: ResultTracker instance providing data
     """
 
     def __init__(self, result_tracker: ResultTracker):
-        """Initialize the summary renderer.
-
-        Args:
-            result_tracker: ResultTracker instance to get data from
-        """
+        """Initialize the summary renderer."""
         self.result_tracker = result_tracker
 
     def print_summary(
@@ -1266,13 +1423,7 @@ class ResultSummaryRenderer:
         parallel_workers: int,
         interrupted: bool = False,
     ) -> None:
-        """Print final execution summary in table format.
-
-        Args:
-            files_to_run: Ordered list of files that were run
-            parallel_workers: Number of parallel workers (0 = serial)
-            interrupted: Whether execution was interrupted
-        """
+        """Print final execution summary in table format."""
         summary_title = "EXECUTION SUMMARY"
         if interrupted:
             summary_title += " (INTERRUPTED)"
@@ -1349,14 +1500,7 @@ class ResultSummaryRenderer:
         max_upload_time: float,
         max_total_duration: float,
     ) -> None:
-        """Render summary table with aligned columns and colors.
-
-        Args:
-            table_data: Table data rows
-            max_compile_time: Maximum compile time (for highlighting)
-            max_upload_time: Maximum upload time (for highlighting)
-            max_total_duration: Maximum total duration (for highlighting)
-        """
+        """Render summary table with aligned columns and colors."""
         headers = ["File", "Status", "Compile (s)", "Upload (s)", "Total (s)", "Retries"]
 
         # Calculate column widths
@@ -1391,12 +1535,7 @@ class ResultSummaryRenderer:
     def _format_cell(self, cell: object, column_idx: int) -> str:
         """Format a cell for display without colors.
 
-        Args:
-            cell: Cell value
-            column_idx: Column index
-
-        Returns:
-            Formatted string
+        Returns Formatted string.
         """
         if column_idx == 1:  # Status column
             if cell == "success":
@@ -1430,15 +1569,7 @@ class ResultSummaryRenderer:
         max_upload_time: float,
         max_total_duration: float,
     ) -> None:
-        """Print a single table row with colors and alignment.
-
-        Args:
-            row: Row data [file, status, compile, upload, total, retries]
-            col_widths: Column widths for alignment
-            max_compile_time: Max compile time for highlighting
-            max_upload_time: Max upload time for highlighting
-            max_total_duration: Max total duration for highlighting
-        """
+        """Print a single table row with colors and alignment."""
         file, status, compile_time, upload_time, total_duration, retry_info = row
 
         # Status with color
@@ -1491,11 +1622,7 @@ class ResultSummaryRenderer:
     def _format_status(self, status: str) -> str:
         """Format status with color.
 
-        Args:
-            status: Status string
-
-        Returns:
-            Colored status string
+        Returns Colored status string.
         """
         if status == "success":
             return f"{Color.GREEN.value}✓ success{Color.RESET.value}"
@@ -1509,12 +1636,7 @@ class ResultSummaryRenderer:
     def _format_time(self, time_val: object, max_time: float) -> str:
         """Format time value with highlighting for max.
 
-        Args:
-            time_val: Time value (float, string, or other)
-            max_time: Maximum time value to compare against
-
-        Returns:
-            Formatted time string with optional highlighting
+        Returns Formatted time string with optional highlighting.
         """
         if isinstance(time_val, float):
             if time_val == max_time and time_val > 0:
@@ -1528,71 +1650,15 @@ class ResultSummaryRenderer:
 # =============================================================================
 
 
-class SerialProgressProtocol(Protocol):
-    """Protocol for serial execution progress display.
-
-    This protocol defines the interface for progress display in serial mode,
-    where files are processed one at a time with live console output.
-    Follows the Interface Segregation Principle by providing only the
-    methods needed for serial execution.
-    """
-
-    def show_progress(
-        self,
-        files_to_run: list[str],
-        current_file: str | None = None,
-    ) -> None:
-        """Display current progress.
-
-        Args:
-            files_to_run: List of all files to process
-            current_file: Currently processing file (if any)
-        """
-        ...
-
-
-class ParallelProgressProtocol(Protocol):
-    """Protocol for parallel execution progress display.
-
-    This protocol defines the interface for progress display in parallel mode,
-    where multiple files are processed simultaneously with output to log files.
-    Follows the Interface Segregation Principle by providing only the
-    methods needed for parallel execution.
-    """
-
-    def start(self) -> None:
-        """Start the progress display (e.g., background thread)."""
-        ...
-
-    def stop(self) -> None:
-        """Stop the progress display and clean up resources."""
-        ...
-
-    def write_to_console(self, message: str) -> None:
-        """Write a message to console in a thread-safe manner.
-
-        Args:
-            message: Message to write to console
-        """
-        ...
-
-
 class SerialProgressDisplay:
     """Progress display for serial execution mode.
 
     Displays a todo list showing status of all files, with the current
     file highlighted. Uses color-coded status indicators.
-
-    Attributes:
-        result_tracker: Tracker for execution results
     """
 
     def __init__(self, result_tracker: ResultTracker):
-        """Initialize serial progress display.
-
-        Args:
-            result_tracker: Result tracker instance
-        """
+        """Initialize serial progress display."""
         self.result_tracker = result_tracker
 
     def show_progress(
@@ -1600,12 +1666,7 @@ class SerialProgressDisplay:
         files_to_run: list[str],
         current_file: str | None = None,
     ) -> None:
-        """Display todo list with current status.
-
-        Args:
-            files_to_run: List of all files to process
-            current_file: Currently processing file
-        """
+        """Display todo list with current status."""
         print("\n" + "=" * 50)
         print_color(Color.BLUE, "EXECUTION TODO LIST")
         print("=" * 50)
@@ -1647,25 +1708,10 @@ class ParallelProgressDisplay:
     Displays a progress bar and list of currently running files.
     Updates continuously in a separate thread. Thread-safe output
     to prevent interleaved writes.
-
-    Attributes:
-        config: Runner configuration
-        result_tracker: Tracker for execution results
-        stdout_lock: Lock for thread-safe console output
-        interrupted: Flag indicating execution was interrupted
-        display_thread: Background thread for progress updates
-        common_prefix: Common directory prefix for all files
-        common_prefix_depth: Number of directory levels in common prefix
     """
 
     def __init__(self, config: RunnerConfig, result_tracker: ResultTracker, files_to_run: list[str]):
-        """Initialize parallel progress display.
-
-        Args:
-            config: Runner configuration
-            result_tracker: Result tracker instance
-            files_to_run: List of all files to be processed
-        """
+        """Initialize parallel progress display."""
         self.config = config
         self.result_tracker = result_tracker
         self.stdout_lock = threading.Lock()
@@ -1734,11 +1780,7 @@ class ParallelProgressDisplay:
     def _build_progress_lines(self, stats: ExecutionStats) -> list[str]:
         """Build lines for progress display.
 
-        Args:
-            stats: Current execution statistics
-
-        Returns:
-            List of lines to display
+        Returns List of lines to display.
         """
         lines = []
 
@@ -1768,11 +1810,7 @@ class ParallelProgressDisplay:
     def _build_progress_bar(self, stats: ExecutionStats) -> str:
         """Build progress bar string.
 
-        Args:
-            stats: Current execution statistics
-
-        Returns:
-            Progress bar string
+        Returns Progress bar string.
         """
         bar_length = self.config.PROGRESS_BAR_LENGTH
         filled = (
@@ -1788,19 +1826,7 @@ class ParallelProgressDisplay:
         2. If common prefix exists, use ../ notation to shrink display
         3. If no common prefix, use middle truncation with ...
 
-        Args:
-            file_path: Full file path to format
-            max_length: Maximum display length
-
-        Returns:
-            Formatted path string, potentially with relative path or truncation
-
-        Examples:
-            >>> # With common prefix "examples/Brand" (depth=2)
-            >>> display._format_path_for_display("examples/Brand/CategoryA/file.yaml", 60)
-            "../../CategoryA/file.yaml"
-            >>> display._format_path_for_display("examples/Brand/CategoryA/long-name.yaml", 30)
-            "../../../long-name.yaml"
+        Returns Formatted path string, potentially with relative path or truncation.
         """
         # If full path fits, return it
         if len(file_path) <= max_length:
@@ -1862,8 +1888,7 @@ class ParallelProgressDisplay:
     def _build_running_files_list(self) -> list[str]:
         """Build list of currently running files.
 
-        Returns:
-            List of formatted strings for running files
+        Returns List of formatted strings for running files.
         """
         lines = []
         worker_num = 1
@@ -1909,84 +1934,15 @@ class ParallelProgressDisplay:
 
         All console output in parallel mode should use this method
         to avoid deadlock with the progress display thread.
-
-        Args:
-            message: Message to write to stdout
         """
         with self.stdout_lock:
             sys.stdout.write(message)
             sys.stdout.flush()
 
-    def show_progress(
-        self,
-        files_to_run: list[str],
-        current_file: str | None = None,
-    ) -> None:
-        """Display current progress (not used in parallel mode).
-
-        This method is required by the ProgressDisplay protocol but is
-        not used in parallel mode, where progress is displayed via the
-        background thread.
-
-        Args:
-            files_to_run: List of all files to process
-            current_file: Currently processing file (if any)
-        """
-        pass  # Progress displayed via background thread
-
 
 # =============================================================================
 # Process Lifecycle Management
 # =============================================================================
-
-
-class ProcessOutput(Protocol):
-    """Protocol for handling process output.
-
-    This protocol allows different output handling strategies to be
-    injected into the process manager.
-    """
-
-    def handle_output(self, data: bytes) -> None:
-        """Handle output data from process.
-
-        Args:
-            data: Raw bytes from process stdout/stderr
-        """
-        ...
-
-
-class ConsoleOutput:
-    """Writes process output to console.
-
-    This implementation writes output to stdout in real-time,
-    suitable for serial execution mode.
-    """
-
-    def handle_output(self, data: bytes) -> None:
-        """Write data to console.
-
-        Args:
-            data: Raw bytes to write to stdout
-        """
-        sys.stdout.write(data.decode(sys.stdout.encoding, errors="replace"))
-        sys.stdout.flush()
-
-
-class NullOutput:
-    """Discards process output.
-
-    This implementation is used in parallel mode where output
-    is written to log files instead of console.
-    """
-
-    def handle_output(self, data: bytes) -> None:
-        """Discard output data.
-
-        Args:
-            data: Raw bytes (ignored)
-        """
-        pass
 
 
 class ProcessManager:
@@ -1995,21 +1951,12 @@ class ProcessManager:
     This class handles process creation, monitoring, and termination,
     abstracting the differences between pty-based (serial) and
     subprocess-based (parallel) execution.
-
-    Attributes:
-        config: Runner configuration
-        current_pid: PID of current process (serial mode)
-        running_processes: Map of file paths to running processes (parallel mode)
-        failure_analyzer: Optional failure analyzer for smart retry decisions
     """
 
     def __init__(self, config: RunnerConfig):
         """Initialize the process manager.
 
         Creates failure analyzer if enabled in configuration (Dependency Injection).
-
-        Args:
-            config: Runner configuration
         """
         self.config = config
         self.current_pid: int | None = None
@@ -2019,7 +1966,7 @@ class ProcessManager:
 
         # Initialize failure analyzer based on configuration (DIP)
         if config.enable_failure_analysis:
-            self.failure_analyzer: FailureAnalyzer | None = ESPHomeFailureAnalyzer()
+            self.failure_analyzer: ESPHomeFailureAnalyzer | None = ESPHomeFailureAnalyzer()
         else:
             self.failure_analyzer = None
 
@@ -2027,18 +1974,13 @@ class ProcessManager:
     def interrupted(self) -> bool:
         """Check if execution has been interrupted (thread-safe).
 
-        Returns:
-            True if interrupted, False otherwise
+        Returns True if interrupted, False otherwise.
         """
         return self._interrupted.is_set()
 
     @interrupted.setter
     def interrupted(self, value: bool) -> None:
-        """Set interrupted status (thread-safe).
-
-        Args:
-            value: True to set interrupted, False to clear
-        """
+        """Set interrupted status (thread-safe)."""
         if value:
             self._interrupted.set()
         else:
@@ -2047,11 +1989,7 @@ class ProcessManager:
     def build_command(self, file_path: str) -> list[str]:
         """Build ESPHome command for execution.
 
-        Args:
-            file_path: Path to YAML file to process
-
-        Returns:
-            Command as list of strings
+        Returns Command as list of strings.
         """
         if self.config.compile_only:
             command = ["esphome", "compile", file_path]
@@ -2069,13 +2007,7 @@ class ProcessManager:
     ) -> str:
         """Format log header with timestamp and execution metadata.
 
-        Args:
-            file_path: Path to YAML file being processed
-            retry_count: Current retry attempt number (0 for first attempt)
-            execution_mode: Execution mode (e.g., "Serial", "Parallel")
-
-        Returns:
-            Formatted log header string
+        Returns Formatted log header string.
         """
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
         command = " ".join(self.build_command(file_path))
@@ -2111,14 +2043,7 @@ class ProcessManager:
         This method uses pty.fork() to create a pseudo-terminal, which
         preserves ANSI color codes in the output. Used for serial mode.
 
-        Args:
-            file_path: Path to YAML file to process
-            log_path: Path to log file
-            retry_count: Current retry attempt number
-            interrupted: Whether execution was interrupted
-
-        Returns:
-            ExecutionResult with execution details
+        Returns ExecutionResult with execution details.
         """
         command = self.build_command(file_path)
         result = create_execution_result(
@@ -2182,15 +2107,7 @@ class ProcessManager:
     ) -> int:
         """Monitor pty process and extract timing information.
 
-        Args:
-            fd: File descriptor for pty
-            file_path: Path to YAML file being processed
-            log_path: Path to log file
-            retry_count: Current retry attempt
-            result: ExecutionResult to update with timing info
-
-        Returns:
-            Process exit code
+        Returns Process exit code.
         """
         exit_code = 1
         compile_time = 0.0
@@ -2256,14 +2173,7 @@ class ProcessManager:
         This method uses subprocess.Popen for better parallel compatibility.
         Output is written to log files instead of console.
 
-        Args:
-            file_path: Path to YAML file to process
-            log_path: Path to log file
-            retry_count: Current retry attempt number
-            start_time: Optional pre-set start time (if None, uses current time)
-
-        Returns:
-            ExecutionResult with execution details
+        Returns ExecutionResult with execution details.
         """
         command = self.build_command(file_path)
         result = create_execution_result(
@@ -2296,7 +2206,7 @@ class ProcessManager:
 
                 try:
                     # Wait for completion with polling for interrupt responsiveness
-                    exit_code = self._wait_for_process(proc, file_path)
+                    exit_code = self._wait_for_process(proc)
                     if exit_code is None:
                         # Process was interrupted or timed out
                         result["status"] = ExecutionStatus.INTERRUPTED if self.interrupted else ExecutionStatus.TIMEOUT
@@ -2339,11 +2249,7 @@ class ProcessManager:
     def _parse_timing_from_log(self, log_path: Path) -> tuple[float, float]:
         """Parse compile and upload times from log file.
 
-        Args:
-            log_path: Path to log file
-
-        Returns:
-            Tuple of (compile_time, upload_time)
+        Returns Tuple of (compile_time, upload_time).
         """
         compile_time = 0.0
         upload_time = 0.0
@@ -2360,17 +2266,10 @@ class ProcessManager:
 
         return compile_time, upload_time
 
-    def _wait_for_process(self, proc: subprocess.Popen[str], file_path: str) -> int | None:
-        """Wait for process with interrupt checking.
+    def _wait_for_process(self, proc: subprocess.Popen[str]) -> int | None:
+        """Wait for process completion, polling for interrupts and timeout.
 
-        Uses polling to check both process completion and interrupt status.
-
-        Args:
-            proc: Process to wait for
-            file_path: Path of file being processed (for tracking)
-
-        Returns:
-            Process exit code, or None if interrupted/timeout
+        Returns the exit code, or None if interrupted/timeout.
         """
         poll_interval = self.config.PROCESS_POLL_INTERVAL
         elapsed = 0.0
@@ -2424,9 +2323,6 @@ class ProcessManager:
 
         Attempts graceful termination with SIGTERM, falling back to
         SIGKILL if necessary.
-
-        Args:
-            proc: Process to terminate
         """
         try:
             proc.terminate()
@@ -2451,7 +2347,7 @@ class ProcessManager:
             processes_snapshot = list(self.running_processes.items())
 
         # Terminate processes outside the lock
-        for file_path, proc in processes_snapshot:
+        for _, proc in processes_snapshot:
             try:
                 self.terminate_process(proc)
             except Exception:
@@ -2487,35 +2383,41 @@ class ProcessManager:
 # =============================================================================
 
 
-class ExecutorProtocol(Protocol):
-    """Protocol for execution strategies.
+class _ExecutorBase:
+    """Shared helpers for the serial/parallel executors.
 
-    This protocol defines the interface that all executor implementations
-    must follow. Using Protocol instead of ABC provides structural
-    subtyping and better type checking with mypy.
+    The retry loops themselves stay separate -- serial narrates to the console
+    and blocks between attempts, parallel keeps IN_PROGRESS bookkeeping and
+    interruptible sleeps -- but the pieces that must agree (log placement,
+    warmup-skip, permanent-failure handling) live here so they cannot drift.
     """
 
-    def execute(self, files: list[str]) -> None:
-        """Execute all files according to strategy.
+    config: RunnerConfig
+    result_tracker: ResultTracker
 
-        Args:
-            files: List of file paths to execute
-        """
-        ...
+    def _log_path_for(self, file_path: str) -> Path:
+        """Log path mirroring the yaml's directory structure, parents ensured."""
+        log_path = self.config.log_dir / Path(file_path).with_suffix(".log")
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        return log_path
+
+    def _already_succeeded(self, file_path: str) -> bool:
+        """True for files already marked SUCCESS (e.g. by the warmup phase)."""
+        existing = self.result_tracker.get_result(file_path)
+        return existing is not None and existing["status"] == ExecutionStatus.SUCCESS
+
+    def _note_permanent_failure(self, file_path: str) -> None:
+        """Record the permanent-failure analysis note in the file's log."""
+        append_failure_analysis_note(
+            self._log_path_for(file_path), FailureType.PERMANENT
+        )
 
 
-class SerialExecutor:
+class SerialExecutor(_ExecutorBase):
     """Executes files sequentially, one at a time.
 
     This executor runs files in serial mode, displaying output to console
     in real-time. It uses pty for process execution to preserve ANSI colors.
-
-    Attributes:
-        config: Runner configuration
-        process_manager: Process lifecycle manager
-        result_tracker: Result tracker
-        progress_display: Progress display strategy
-        interrupted: Flag indicating execution was interrupted
     """
 
     def __init__(
@@ -2523,28 +2425,21 @@ class SerialExecutor:
         config: RunnerConfig,
         process_manager: ProcessManager,
         result_tracker: ResultTracker,
-        progress_display: SerialProgressProtocol,
+        progress_display: SerialProgressDisplay,
     ):
-        """Initialize serial executor.
-
-        Args:
-            config: Runner configuration
-            process_manager: Process manager instance
-            result_tracker: Result tracker instance
-            progress_display: Progress display instance
-        """
+        """Initialize serial executor."""
         self.config = config
         self.process_manager = process_manager
         self.result_tracker = result_tracker
         self.progress_display = progress_display
         self.interrupted = False
 
-    def execute(self, files: list[str]) -> None:
-        """Execute files sequentially.
+    def set_warmup_gate(self, warmup: "WarmupPhase") -> None:
+        """No-op: warmup is skipped in serial mode (no race to mitigate)."""
+        del warmup
 
-        Args:
-            files: List of file paths to execute
-        """
+    def execute(self, files: list[str]) -> None:
+        """Execute files sequentially."""
         try:
             for file_path in files:
                 if self.interrupted:
@@ -2560,14 +2455,9 @@ class SerialExecutor:
             self._handle_interrupt()
 
     def _execute_file_with_retry(self, file_path: str) -> None:
-        """Execute a single file with retry logic.
-
-        Args:
-            file_path: Path to file to execute
-        """
+        """Execute a single file with retry logic."""
         # Skip files already marked SUCCESS by the warmup phase
-        existing = self.result_tracker.get_result(file_path)
-        if existing is not None and existing["status"] == ExecutionStatus.SUCCESS:
+        if self._already_succeeded(file_path):
             return
 
         retry_count = 0
@@ -2591,11 +2481,7 @@ class SerialExecutor:
                 success = True
                 print_color(Color.GREEN, f"\n✓ Success: {file_path}")
             elif result.get("failure_type") == FailureType.PERMANENT:
-                # Permanent error detected - skip retry
-                # Append analysis note to log file
-                log_path = self.config.log_dir / Path(file_path).with_suffix('.log')
-                append_failure_analysis_note(log_path, FailureType.PERMANENT)
-
+                self._note_permanent_failure(file_path)
                 print_color(
                     Color.YELLOW,
                     f"\n⚠ Configuration error detected in {file_path}, skipping retry"
@@ -2612,18 +2498,9 @@ class SerialExecutor:
     def _execute_single_file(self, file_path: str, retry_count: int) -> ExecutionResult:
         """Execute a single file.
 
-        Args:
-            file_path: Path to file to execute
-            retry_count: Current retry attempt
-
-        Returns:
-            ExecutionResult with execution details
+        Returns ExecutionResult with execution details.
         """
-        file = Path(file_path)
-        # Preserve directory structure in logs
-        log_path = self.config.log_dir / file.with_suffix('.log')
-        # Ensure parent directory exists
-        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path = self._log_path_for(file_path)
 
         print("=" * 50)
         print_color(Color.BLUE, f"Running: {file_path}")
@@ -2648,19 +2525,12 @@ class SerialExecutor:
         self.process_manager.terminate_current_process()
 
 
-class ParallelExecutor:
+class ParallelExecutor(_ExecutorBase):
     """Executes files in parallel using multiple workers.
 
     This executor runs multiple files simultaneously using ThreadPoolExecutor.
     Output is written to log files instead of console. Progress is displayed
     via a background thread.
-
-    Attributes:
-        config: Runner configuration
-        process_manager: Process lifecycle manager
-        result_tracker: Result tracker
-        progress_display: Progress display strategy (ParallelProgressDisplay)
-        interrupted: Flag indicating execution was interrupted
     """
 
     def __init__(
@@ -2668,25 +2538,33 @@ class ParallelExecutor:
         config: RunnerConfig,
         process_manager: ProcessManager,
         result_tracker: ResultTracker,
-        progress_display: ParallelProgressProtocol,
+        progress_display: ParallelProgressDisplay,
     ):
-        """Initialize parallel executor.
-
-        Args:
-            config: Runner configuration
-            process_manager: Process manager instance
-            result_tracker: Result tracker instance
-            progress_display: Progress display instance (ParallelProgressProtocol)
-        """
+        """Initialize parallel executor."""
         self.config = config
         self.process_manager = process_manager
         self.result_tracker = result_tracker
         self.progress_display = progress_display
         self.interrupted = False
         # Slow-start state: enforce minimum gap between task starts to mitigate
-        # pioarduino's install_esptool() --force-reinstall race on shared penv/.
+        # cold-cache toolchain install races. Mutable (unlike the frozen
+        # config) so the runner can zero it when the warmup stamp shows the
+        # toolchain caches are already warm.
+        self.slow_start_interval = config.slow_start_interval
         self.last_task_start_time: float | None = None
         self.start_time_lock = threading.Lock()
+        # Streaming warmup gate: workers block here until their toolchain
+        # bucket has been warmed up by WarmupPhase.
+        self._warmup_gate: "WarmupPhase | None" = None
+
+    def set_warmup_gate(self, warmup: "WarmupPhase") -> None:
+        """Register a WarmupPhase so workers can block on per-bucket readiness.
+
+        Called by ESPHomeRunner before execute() when streaming warmup is
+        active. Workers call warmup.wait_for_file() at the start of each
+        file's execution; it's a no-op when streaming is disabled.
+        """
+        self._warmup_gate = warmup
 
     def _wait_for_slow_start(self) -> None:
         """Block until the slow-start interval has elapsed since the last task start.
@@ -2695,23 +2573,19 @@ class ParallelExecutor:
         via `start_time_lock` — holding the lock while sleeping is intentional, it
         forces other workers to queue up and stagger their starts.
         """
-        if self.config.slow_start_interval <= 0:
+        if self.slow_start_interval <= 0:
             return
         with self.start_time_lock:
             if self.last_task_start_time is not None:
                 elapsed = time.time() - self.last_task_start_time
-                if elapsed < self.config.slow_start_interval:
+                if elapsed < self.slow_start_interval:
                     self._interruptible_sleep(
-                        self.config.slow_start_interval - elapsed
+                        self.slow_start_interval - elapsed
                     )
             self.last_task_start_time = time.time()
 
     def execute(self, files: list[str]) -> None:
-        """Execute files in parallel.
-
-        Args:
-            files: List of file paths to execute
-        """
+        """Execute files in parallel."""
         # Import ThreadPoolExecutor here to avoid issues
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -2785,15 +2659,21 @@ class ParallelExecutor:
                 pass
 
     def _execute_file_with_retry(self, file_path: str) -> None:
-        """Execute a single file with retry logic.
-
-        Args:
-            file_path: Path to file to execute
-        """
+        """Execute a single file with retry logic."""
         # Skip files already marked SUCCESS by the warmup phase
-        existing = self.result_tracker.get_result(file_path)
-        if existing is not None and existing["status"] == ExecutionStatus.SUCCESS:
+        if self._already_succeeded(file_path):
             return
+
+        # Streaming warmup gate: block until this file's toolchain bucket has
+        # been pre-compiled. No-op when warmup is disabled or already done.
+        if self._warmup_gate is not None:
+            self._warmup_gate.wait_for_file(file_path)
+            # Warmup may have marked the rep SUCCESS while we were blocked.
+            if self._already_succeeded(file_path):
+                return
+            # Bail out early if we were interrupted during the wait.
+            if self.interrupted:
+                return
 
         # Stagger starts to avoid concurrent pioarduino install_esptool races
         self._wait_for_slow_start()
@@ -2840,11 +2720,7 @@ class ParallelExecutor:
 
             # Check for permanent failure (skip retry for config errors)
             if result.get("failure_type") == FailureType.PERMANENT:
-                # Permanent error detected - don't retry
-                # Append analysis note to log file
-                log_path = self.config.log_dir / Path(file_path).with_suffix('.log')
-                append_failure_analysis_note(log_path, FailureType.PERMANENT)
-
+                self._note_permanent_failure(file_path)
                 self.result_tracker.update_result(file_path, result)
                 return
 
@@ -2867,32 +2743,16 @@ class ParallelExecutor:
     ) -> ExecutionResult:
         """Execute a single file.
 
-        Args:
-            file_path: Path to file to execute
-            retry_count: Current retry attempt
-            start_time: Pre-set start time captured before execution
-
-        Returns:
-            ExecutionResult with execution details
+        Returns ExecutionResult with execution details.
         """
-        file = Path(file_path)
-        # Preserve directory structure in logs
-        log_path = self.config.log_dir / file.with_suffix('.log')
-        # Ensure parent directory exists
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-
         result = self.process_manager.run_with_subprocess(
-            file_path, log_path, retry_count, start_time
+            file_path, self._log_path_for(file_path), retry_count, start_time
         )
 
         return result
 
     def _interruptible_sleep(self, duration: float) -> None:
-        """Sleep in short intervals to allow interrupt checking.
-
-        Args:
-            duration: Total sleep duration in seconds
-        """
+        """Sleep in short intervals to allow interrupt checking."""
         interval = self.config.INTERRUPT_POLL_INTERVAL
         elapsed = 0.0
         while elapsed < duration and not self.interrupted:
@@ -2913,6 +2773,15 @@ class ParallelExecutor:
         print_color(Color.YELLOW, "Interrupt signal received! Stopping all workers...")
         print_color(Color.YELLOW, "(Press Ctrl+C again to force exit)")
 
+        # Cancel any in-flight streaming warmup so workers blocked in
+        # wait_for_file() unblock immediately and the warmup subprocess
+        # gets terminated instead of running to natural completion.
+        if self._warmup_gate is not None:
+            try:
+                self._warmup_gate.cancel()
+            except Exception:
+                pass
+
         # Terminate all running processes
         try:
             self.process_manager.terminate_all_processes()
@@ -2920,67 +2789,29 @@ class ParallelExecutor:
             pass  # Ignore errors during interrupt
 
 
-# =============================================================================
-# Executor Factory
-# =============================================================================
-
-
-class ExecutorFactory:
-    """Factory for creating execution strategies.
-
-    This class implements the Factory Pattern to create appropriate executor
-    instances based on configuration. It encapsulates the creation logic and
-    dependencies, improving testability and adhering to the Dependency
-    Inversion Principle.
-
-    The factory handles:
-    - Strategy selection (serial vs parallel)
-    - Progress display creation
-    - Dependency injection for executors
-    """
-
-    @staticmethod
-    def create(
-        config: RunnerConfig,
-        process_manager: ProcessManager,
-        result_tracker: ResultTracker,
-    ) -> ExecutorProtocol:
-        """Create appropriate executor based on configuration.
-
-        Args:
-            config: Runner configuration
-            process_manager: Process lifecycle manager
-            result_tracker: Result tracker
-
-        Returns:
-            ExecutorProtocol: Serial or parallel executor instance
-
-        Examples:
-            >>> factory = ExecutorFactory()
-            >>> executor = factory.create(config, process_mgr, tracker)
-        """
-        if config.parallel_workers > 0:
-            # Create parallel executor with parallel progress display
-            progress_display = ParallelProgressDisplay(
+def create_executor(
+    config: RunnerConfig,
+    process_manager: ProcessManager,
+    result_tracker: ResultTracker,
+) -> "SerialExecutor | ParallelExecutor":
+    """Create the executor (and its progress display) for the configured mode."""
+    if config.parallel_workers > 0:
+        return ParallelExecutor(
+            config=config,
+            process_manager=process_manager,
+            result_tracker=result_tracker,
+            progress_display=ParallelProgressDisplay(
                 config=config,
                 result_tracker=result_tracker,
                 files_to_run=config.files_to_run,
-            )
-            return ParallelExecutor(
-                config=config,
-                process_manager=process_manager,
-                result_tracker=result_tracker,
-                progress_display=progress_display,
-            )
-        else:
-            # Create serial executor with serial progress display
-            progress_display = SerialProgressDisplay(result_tracker=result_tracker)
-            return SerialExecutor(
-                config=config,
-                process_manager=process_manager,
-                result_tracker=result_tracker,
-                progress_display=progress_display,
-            )
+            ),
+        )
+    return SerialExecutor(
+        config=config,
+        process_manager=process_manager,
+        result_tracker=result_tracker,
+        progress_display=SerialProgressDisplay(result_tracker=result_tracker),
+    )
 
 
 # =============================================================================
@@ -2994,14 +2825,6 @@ class ESPHomeRunner:
     This class follows the Single Responsibility Principle by delegating
     specific responsibilities to specialized components. It coordinates the
     overall execution flow by composing these components together.
-
-    Attributes:
-        config: Runner configuration
-        file_filter: File filtering component
-        process_manager: Process lifecycle manager
-        result_tracker: Result tracking component
-        executor: Execution strategy (serial or parallel)
-        files_to_run: Filtered list of files to execute
     """
 
     def __init__(self, config: RunnerConfig):
@@ -3011,11 +2834,7 @@ class ESPHomeRunner:
         composition. This follows the Dependency Inversion Principle by
         depending on abstractions (protocols) rather than concrete classes.
 
-        Args:
-            config: Runner configuration
-
-        Raises:
-            ConfigurationError: If log directory cannot be created
+        Raises ConfigurationError if log directory cannot be created.
         """
         self.config = config
 
@@ -3035,7 +2854,7 @@ class ESPHomeRunner:
         self.result_tracker = ResultTracker()
 
         # Create executor using factory (Dependency Inversion Principle)
-        self.executor = ExecutorFactory.create(
+        self.executor = create_executor(
             config=config,
             process_manager=self.process_manager,
             result_tracker=self.result_tracker,
@@ -3077,28 +2896,47 @@ class ESPHomeRunner:
         # covers the whole run including warmup, not just parallel dispatch.
         self.result_tracker.overall_start_time = time.time()
 
-        # Step 2.5: Warmup phase — populate PIO toolchain cache before parallel dispatch
-        warmup_outcome = self.warmup.run(self.files_to_run)
-        # Seed tracker so parallel phase skips re-compilation.
-        # ResultTracker.initialize_results (called inside executor.execute) preserves
-        # SUCCESS entries on re-init, so seeding here is durable.
-        for rep in warmup_outcome.reps_compiled:
-            self.result_tracker.update_result(
-                rep,
-                create_execution_result(
-                    status=ExecutionStatus.SUCCESS,
-                    retry_count=0,
-                ),
-            )
-        # Warmup guarantees sources are compiled at least once in this version;
-        # opt out of ESPHome's clean step for subsequent builds.
-        if warmup_outcome.success and not warmup_outcome.disabled:
-            os.environ["ESPHOME_SKIP_CLEAN_BUILD"] = "1"
+        # Step 2.5: Warmup phase — populate PIO toolchain cache.
+        # begin() runs the probe synchronously and either:
+        #   - returns a terminal outcome (warmup disabled / serial / cache hit),
+        #     in which case we apply post-warmup actions immediately, or
+        #   - starts background compilation and returns None; workers will
+        #     gate on per-bucket events as each rep finishes, so dispatch
+        #     can overlap with warmup instead of waiting for it to finish.
+        self.executor.set_warmup_gate(self.warmup)
+        warmup_outcome = self.warmup.begin(
+            self.files_to_run, self.result_tracker
+        )
+        streaming = warmup_outcome is None
+        if not streaming and warmup_outcome is not None:
+            # Terminal outcome — replicate the legacy post-warmup actions.
+            for rep in warmup_outcome.reps_compiled:
+                self.result_tracker.update_result(
+                    rep,
+                    create_execution_result(
+                        status=ExecutionStatus.SUCCESS,
+                        retry_count=0,
+                    ),
+                )
+            if warmup_outcome.success and not warmup_outcome.disabled:
+                os.environ["ESPHOME_SKIP_CLEAN_BUILD"] = "1"
+            if warmup_outcome.cache_hit and isinstance(
+                self.executor, ParallelExecutor
+            ):
+                # Toolchain caches proven warm -- staggered starts would only
+                # add idle time; the races they mitigate need a cold cache.
+                self.executor.slow_start_interval = 0.0
 
         # Step 3: Execute files
         try:
             self.executor.execute(self.files_to_run)
         finally:
+            # Streaming warmup may still be running if the executor exited
+            # early (e.g. Ctrl-C). Always join so we don't leave a daemon
+            # subprocess running, and so reps_compiled / success reflect the
+            # final state for the summary.
+            if streaming:
+                self.warmup.finish()
             # Always record end time and display summary, even on error
             self.result_tracker.overall_end_time = time.time()
 
@@ -3141,15 +2979,27 @@ class ESPHomeRunner:
                 "[Smart failure analysis: DISABLED - all errors will retry]"
             )
 
-        # Display warmup status
-        if self.config.warmup_enabled:
-            version = self.config.esphome_version or "unknown"
-            if self.config.warmup_cache_path.is_file():
-                print_color(Color.BLUE, f"[Warmup: cache hit for ESPHome v{version}]")
-            else:
-                print_color(Color.BLUE, f"[Warmup: enabled (ESPHome v{version})]")
-        else:
+        # Display warmup status — order matches WarmupPhase.begin() so the
+        # header never claims a state begin() won't honor.
+        version = self.config.esphome_version or "unknown"
+        if not self.config.warmup_enabled:
             print_color(Color.YELLOW, "[Warmup: disabled]")
+        elif read_warmup_stamp(
+            self.config.warmup_cache_path, self.config.toolchain_fingerprint
+        ):
+            print_color(Color.BLUE, f"[Warmup: cache hit for ESPHome v{version}]")
+        elif self.config.warmup_cache_path.is_file():
+            print_color(
+                Color.BLUE,
+                f"[Warmup: toolchain changed — re-warming for ESPHome v{version}]",
+            )
+        elif self.config.parallel_workers <= 1:
+            print_color(
+                Color.YELLOW,
+                "[Warmup: skipped (single worker — no race to mitigate)]"
+            )
+        else:
+            print_color(Color.BLUE, f"[Warmup: enabled (ESPHome v{version})]")
 
         print(f"Starting at: {datetime.now()}")
 
@@ -3162,8 +3012,7 @@ class ESPHomeRunner:
 def parse_arguments() -> argparse.Namespace:
     """Parse command-line arguments.
 
-    Returns:
-        Parsed arguments namespace
+    Returns Parsed arguments namespace.
     """
     description = """ESPHome Multi-Run Tool - Batch compile and upload multiple ESPHome configurations
 
@@ -3342,8 +3191,9 @@ DIRECTORY STRUCTURE:
         default=None,
         metavar="SECONDS",
         help="Minimum gap (seconds) between parallel task starts.\n"
-        "Default: 5.0. Mitigates pioarduino's install_esptool() race\n"
-        "where concurrent compiles can delete penv/bin/esptool mid-install.\n"
+        "Default: 10.0. Mitigates cold-cache toolchain install races\n"
+        "(pioarduino install_esptool, native ESP-IDF extraction).\n"
+        "Automatically 0 when the warmup stamp shows warm caches.\n"
         "Set to 0 to disable.",
     )
 
@@ -3353,11 +3203,7 @@ DIRECTORY STRUCTURE:
 def collect_files(args: argparse.Namespace) -> list[str]:
     """Collect all files to run based on arguments.
 
-    Args:
-        args: Parsed command-line arguments
-
-    Returns:
-        Sorted list of unique file paths
+    Returns Sorted list of unique file paths.
     """
     files_to_run = set(args.files)
 
@@ -3379,12 +3225,7 @@ def collect_files(args: argparse.Namespace) -> list[str]:
 def validate_arguments(args: argparse.Namespace, files: list[str]) -> None:
     """Validate command-line arguments and collected files.
 
-    Args:
-        args: Parsed command-line arguments
-        files: Collected files to run
-
-    Raises:
-        SystemExit: If validation fails
+    Raises SystemExit if validation fails.
     """
     if args.parallel < 0:
         print_color(Color.RED, "Error: Parallel workers must be 0 or positive.")
@@ -3398,15 +3239,9 @@ def validate_arguments(args: argparse.Namespace, files: list[str]) -> None:
 def create_runner_config(args: argparse.Namespace, files: list[str]) -> RunnerConfig:
     """Create RunnerConfig from command-line arguments.
 
-    Args:
-        args: Parsed command-line arguments
-        files: Collected files to run
+    Returns RunnerConfig instance.
 
-    Returns:
-        RunnerConfig instance
-
-    Raises:
-        ConfigurationError: If parameters are invalid
+    Raises ConfigurationError if parameters are invalid.
     """
     # Validate max_retries
     if args.max_retries < 0:
@@ -3425,9 +3260,10 @@ def create_runner_config(args: argparse.Namespace, files: list[str]) -> RunnerCo
     else:
         warmup_cache_dir = _default_cache_dir()
     esphome_version = get_esphome_version()
+    toolchain_fingerprint = get_toolchain_fingerprint()
 
     slow_start_interval = (
-        args.slow_start_interval if args.slow_start_interval is not None else 5.0
+        args.slow_start_interval if args.slow_start_interval is not None else 10.0
     )
     if slow_start_interval < 0:
         raise ConfigurationError(
@@ -3445,6 +3281,7 @@ def create_runner_config(args: argparse.Namespace, files: list[str]) -> RunnerCo
         warmup_enabled=warmup_enabled,
         warmup_cache_dir=warmup_cache_dir,
         esphome_version=esphome_version,
+        toolchain_fingerprint=toolchain_fingerprint,
         slow_start_interval=slow_start_interval,
     )
 
