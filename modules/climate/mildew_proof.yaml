@@ -98,7 +98,7 @@ globals:
     initial_value: 'false'
 
   - id: mildew_proof_start_time
-    type: time_t
+    type: uint32_t
     initial_value: '0'
 
   - id: mildew_proof_internal_action
@@ -110,7 +110,7 @@ globals:
     initial_value: '0'
 
   - id: state_change_window_start
-    type: time_t
+    type: uint32_t
     initial_value: '0'
 
   - id: loop_protection_active
@@ -224,10 +224,9 @@ text_sensor:
         return std::string("");
       }
 
-      time_t now = millis() / 1000;
-      int elapsed = (int)(now - id(mildew_proof_start_time));
+      uint32_t elapsed_ms = esphome::millis() - id(mildew_proof_start_time);
       int total_duration = (int)(id(mildew_proof_duration).state * 60);
-      int remaining = total_duration - elapsed;
+      int remaining = total_duration - (int)(elapsed_ms / 1000);
 
       if (remaining <= 0) {
         return std::string("00:00");
@@ -258,14 +257,14 @@ script:
           // ========================================
           // INITIALIZATION
           // ========================================
-          time_t now = millis() / 1000;
+          uint32_t now = esphome::millis();
 
           // ========================================
           // SECTION 1: ANOMALY LOOP DETECTION
           // ========================================
 
           // Reset counter if window expired
-          if (now - id(state_change_window_start) > $loop_detection_window_seconds) {
+          if (now - id(state_change_window_start) > $loop_detection_window_seconds * 1000UL) {
             id(state_change_count) = 0;
             id(state_change_window_start) = now;
           }
@@ -297,12 +296,12 @@ script:
 
           // Check if in cooldown period
           if (id(loop_protection_active)) {
-            static time_t cooldown_start = 0;
+            static uint32_t cooldown_start = 0;
             if (cooldown_start == 0) {
               cooldown_start = now;
             }
 
-            if (now - cooldown_start < $loop_protection_cooldown_seconds) {
+            if (now - cooldown_start < $loop_protection_cooldown_seconds * 1000UL) {
               ESP_LOGD("mildew_proof", "In cooldown period, skipping processing");
               return;
             } else {
@@ -451,7 +450,7 @@ script:
 
           ESP_LOGI("mildew_proof", "Starting mildew proof process");
           id(mildew_proof_mode_active) = true;
-          id(mildew_proof_start_time) = millis() / 1000;
+          id(mildew_proof_start_time) = esphome::millis();
 
           id(mildew_proof_internal_action) = true;
           auto call = id($climate_id).make_call();
