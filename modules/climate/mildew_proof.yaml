@@ -224,7 +224,7 @@ text_sensor:
         return std::string("");
       }
 
-      uint32_t elapsed_ms = esphome::millis() - id(mildew_proof_start_time);
+      uint32_t elapsed_ms = millis() - id(mildew_proof_start_time);
       int total_duration = (int)(id(mildew_proof_duration).state * 60);
       int remaining = total_duration - (int)(elapsed_ms / 1000);
 
@@ -257,7 +257,7 @@ script:
           // ========================================
           // INITIALIZATION
           // ========================================
-          uint32_t now = esphome::millis();
+          uint32_t now = millis();
 
           // ========================================
           // SECTION 1: ANOMALY LOOP DETECTION
@@ -450,7 +450,7 @@ script:
 
           ESP_LOGI("mildew_proof", "Starting mildew proof process");
           id(mildew_proof_mode_active) = true;
-          id(mildew_proof_start_time) = esphome::millis();
+          id(mildew_proof_start_time) = millis();
 
           id(mildew_proof_internal_action) = true;
           auto call = id($climate_id).make_call();
